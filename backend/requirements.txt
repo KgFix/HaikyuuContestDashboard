@@ -1,0 +1,4 @@
+fastapi==0.123.4 
+uvicorn[standard]==0.38.0
+pytesseract==0.3.13 
+firebase-admin==13.6.0

@@ -194,7 +194,7 @@ def check_rate_limit(user_id: int) -> Tuple[bool, int]:
     return True, 0
 
 def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int,
-                     weekly_score: int, total_power: int, user_id: int, username: str) -> dict:
+                     weekly_score: int, total_power: int, username: str) -> dict:
     """
     Creates a submission entry in DynamoDB.
     
@@ -204,29 +204,29 @@ def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int,
         highest_today: Highest score today
         weekly_score: Weekly score
         total_power: Total power
-        user_id: Discord user ID
         username: Discord username
         
     Returns:
         dict: Response from DynamoDB put_item operation
     """
     try:
-        # Use timestamp as sort key for easy querying, with UUID for uniqueness
-        timestamp = int(datetime_obj.timestamp())
-        submission_id = str(uuid.uuid4())
-        sort_key = f"{timestamp}#{submission_id}"
+        # Use ISO datetime as sort key for easy date-range queries
+        # ISO format naturally sorts chronologically and supports begins_with, between
+        datetime_str = datetime_obj.isoformat()
         
         # Prepare item for DynamoDB
+        # Schema: ClubName (Partition Key) + DateTime (Sort Key)
+        # This allows efficient queries like:
+        # - All submissions for a club
+        # - Submissions within a date range
+        # - Latest submissions (reverse sort)
+        # - Today's submissions (begins_with)
         item = {
-            'ClubName': club_name,
-            'DateTimestamp': sort_key,  # Sortable by timestamp
-            'SubmissionId': submission_id,
-            'Timestamp': timestamp,
-            'DateTime': datetime_obj.isoformat(),
+            'ClubName': club_name,           # Partition Key
+            'DateTime': datetime_str,        # Sort Key: ISO format for chronological sorting
             'HighestToday': highest_today,
             'WeeklyScore': weekly_score,
             'TotalPower': total_power,
-            'UserId': str(user_id),
             'Username': username,
             'EntryType': 'Submission'
         }
@@ -238,7 +238,7 @@ def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int,
             'success': True,
             'response': response,
             'club_name': club_name,
-            'sort_key': sort_key
+            'datetime': datetime_str
         }
     except Exception as e:
         print(f"❌ DynamoDB write error: {str(e)}")
@@ -737,8 +737,7 @@ async def submit(interaction: discord.Interaction, image: discord.Attachment):
                 highest_today=result.daily_high,
                 weekly_score=result.rank_score,
                 total_power=result.total_power,
-                user_id=interaction.user.id,
-                username=interaction.user.name
+                username=guild_nick
             )
             
             if submission_result['success']:

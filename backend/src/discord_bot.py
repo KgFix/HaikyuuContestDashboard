@@ -9,10 +9,27 @@ import easyocr
 import re
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import boto3
+from datetime import datetime
+from decimal import Decimal
+import uuid
 
 # Load environment variables
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+AWS_REGION = os.getenv('AWS_REGION')
+DYNAMODB_TABLE_NAME = os.getenv('DYNAMODB_TABLE_NAME')
+
+# Initialize DynamoDB client
+dynamodb = boto3.resource(
+    'dynamodb',
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=AWS_REGION
+)
+table = dynamodb.Table(DYNAMODB_TABLE_NAME)
 
 # --- CONFIGURATION FOR STATIC ROI ---
 REF_WIDTH = 2556
@@ -37,7 +54,56 @@ bot = commands.Bot(command_prefix='/', intents=intents)
 
 executor = ThreadPoolExecutor(max_workers=2)
 
+# Store activated channels with their associated roles
+# Key: (guild_id, channel_id), Value: role_name
+activated_channels = {}
+
 # --- HELPER FUNCTIONS ---
+
+def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int, 
+                     weekly_score: int, total_power: int) -> dict:
+    """
+    Creates a submission entry in DynamoDB.
+    
+    Args:
+        datetime_obj: The datetime of the submission
+        club_name: Name of the club (Partition Key)
+        highest_today: Highest score today
+        weekly_score: Weekly score
+        total_power: Total power
+        
+    Returns:
+        dict: Response from DynamoDB put_item operation
+    """
+    try:
+        # Format date with UUID to ensure uniqueness
+        date_str = f"{datetime_obj.isoformat()}#{str(uuid.uuid4())}"
+        # Example: "2025-12-06T14:30:45.123456#a3d5f891-c2e4-4b3a-9f12-1234567890ab"
+        
+        # Prepare item for DynamoDB
+        item = {
+            'ClubName': club_name,      # Partition Key (String)
+            'Date': date_str,           # Sort Key (String) - with UUID for uniqueness
+            'HighestToday': highest_today,
+            'WeeklyScore': weekly_score,
+            'TotalPower': total_power,
+            'EntryType': 'Test'
+        }
+        
+        # Put item into DynamoDB
+        response = table.put_item(Item=item)
+        
+        return {
+            'success': True,
+            'response': response,
+            'club_name': club_name,
+            'date': date_str
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e)
+        }
 
 def clean_text(text: str, is_number: bool = False) -> str:
     if not text: return ""
@@ -47,6 +113,25 @@ def clean_text(text: str, is_number: bool = False) -> str:
         return int(clean) if clean else 0
     clean = re.sub(r'[^\w\s]', '', text).strip()
     return clean
+
+
+async def get_guild_nick(interaction: discord.Interaction) -> str | None:
+    """Return the server-specific nickname for the user, or None if not available.
+
+    This returns the raw `Member.nick` (which can be `None` if the user has no nickname set).
+    We intentionally do NOT fall back to display_name or username because you asked
+    to compare specifically against the server profile name.
+    """
+    if interaction.guild is None:
+        return None
+    member = interaction.guild.get_member(interaction.user.id)
+    try:
+        if member is None:
+            member = await interaction.guild.fetch_member(interaction.user.id)
+    except Exception:
+        # Could not fetch member (missing perms or other issue)
+        return None
+    return member.nick if member is not None else None
 
 def get_anchored_roi(image: np.ndarray, ref_rect: tuple, anchor_x: str, anchor_y: str) -> tuple:
     """Calculates static ROI coordinates based on reference resolution."""
@@ -235,8 +320,64 @@ async def on_ready():
     except Exception as e:
         print(f"Sync failed: {e}")
 
+@bot.tree.command(name="activatecontestsubmissions", description="Activate contest submissions in this channel (Moderator only)")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def activate_channel(interaction: discord.Interaction, role: discord.Role):
+    """Activate contest submissions for this channel with a specific role. Requires moderator permissions."""
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+    
+    channel_key = (interaction.guild.id, interaction.channel.id)
+    
+    if channel_key in activated_channels:
+        old_role = activated_channels[channel_key]
+        activated_channels[channel_key] = role.name
+        await interaction.response.send_message(
+            f"✅ Contest submissions in this channel have been updated!\n"
+            f"**Previous Role:** {old_role}\n"
+            f"**New Role:** {role.mention}\n"
+            f"Users can now use `/submit` and `/calibrate` commands here.",
+            ephemeral=False
+        )
+    else:
+        activated_channels[channel_key] = role.name
+        await interaction.response.send_message(
+            f"✅ Contest submissions are now **activated** in this channel!\n"
+            f"**Associated Role:** {role.mention}\n"
+            f"Users can now use `/submit` and `/calibrate` commands here.",
+            ephemeral=False
+        )
+
+@activate_channel.error
+async def activate_channel_error(interaction: discord.Interaction, error):
+    """Handle permission errors for the activate command."""
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You need moderator permissions to activate contest submissions.",
+            ephemeral=True
+        )
+
+
 @bot.tree.command(name="submit", description="Submit a screenshot for scoring")
 async def submit(interaction: discord.Interaction, image: discord.Attachment):
+    # Check if channel is activated
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+    
+    channel_key = (interaction.guild.id, interaction.channel.id)
+    if channel_key not in activated_channels:
+        await interaction.response.send_message(
+            "❌ Contest submissions are not activated in this channel.\n"
+            "A moderator needs to use `/activatecontestsubmissions @role` first.",
+            ephemeral=True
+        )
+        return
+    
+    # Get the associated role name for this channel
+    channel_role = activated_channels[channel_key]
+    
     await interaction.response.defer()
     
     if not image.content_type.startswith('image/'):
@@ -273,7 +414,60 @@ async def submit(interaction: discord.Interaction, image: discord.Attachment):
             inline=True
         )
         embed.set_thumbnail(url=image.url)
-        
+        # --- Compare detected leaderboard name with the server-specific nickname ---
+        detected_name_raw = data.get('rank_name', '') or ''
+        detected_name = clean_text(detected_name_raw, is_number=False)
+
+        guild_nick = await get_guild_nick(interaction)
+        if guild_nick is None:
+            match_text = "No server nickname set (cannot validate)"
+        else:
+            nick_clean = clean_text(guild_nick, is_number=False)
+            match_text = "✅ Match" if nick_clean.lower() == detected_name.lower() else "❌ Mismatch"
+
+        embed.add_field(name="👥 Server Nickname", value=guild_nick or "—", inline=True)
+        embed.add_field(name="🔎 Detected Name", value=detected_name_raw or "—", inline=True)
+        embed.add_field(name="✅ Nickname Match", value=match_text, inline=False)
+        embed.add_field(name="🏷️ Channel Role", value=channel_role, inline=False)
+
+        # Create submission in DynamoDB if names match
+        if guild_nick is not None:
+            nick_clean = clean_text(guild_nick, is_number=False)
+            if nick_clean.lower() == detected_name.lower():
+                # Names match - create submission
+                submission_result = createSubmission(
+                    datetime_obj=datetime.now(),
+                    club_name=channel_role,
+                    highest_today=data.get('daily_high', 0),
+                    weekly_score=data.get('rank_score', 0),
+                    total_power=data.get('total_power', 0)
+                )
+                
+                if submission_result['success']:
+                    embed.add_field(
+                        name="💾 Database", 
+                        value="✅ Submission saved successfully!", 
+                        inline=False
+                    )
+                else:
+                    embed.add_field(
+                        name="💾 Database", 
+                        value=f"⚠️ Failed to save: {submission_result.get('error', 'Unknown error')}", 
+                        inline=False
+                    )
+            else:
+                embed.add_field(
+                    name="💾 Database", 
+                    value="❌ Not saved - nickname mismatch", 
+                    inline=False
+                )
+        else:
+            embed.add_field(
+                name="💾 Database", 
+                value="❌ Not saved - no server nickname set", 
+                inline=False
+            )
+
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
@@ -281,6 +475,23 @@ async def submit(interaction: discord.Interaction, image: discord.Attachment):
 
 @bot.tree.command(name="calibrate", description="Debug view: Green=Static, Red=PowerZone, Blue=LeaderboardZone")
 async def calibrate(interaction: discord.Interaction, image: discord.Attachment):
+    # Check if channel is activated
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+    
+    channel_key = (interaction.guild.id, interaction.channel.id)
+    if channel_key not in activated_channels:
+        await interaction.response.send_message(
+            "❌ Contest submissions are not activated in this channel.\n"
+            "A moderator needs to use `/activatecontestsubmissions @role` first.",
+            ephemeral=True
+        )
+        return
+    
+    # Get the associated role name for this channel
+    channel_role = activated_channels[channel_key]
+    
     await interaction.response.defer()
     try:
         image_data = await image.read()

@@ -31,3 +31,15 @@ yarn-error.log*
 /backend/.env.*
 /frontend/my-app/.env
 /frontend/my-app/.env.*
+ 
+# Python virtual environments & caches
+/backend/.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+

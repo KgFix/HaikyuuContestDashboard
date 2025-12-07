@@ -67,6 +67,12 @@ LEADERBOARD_NAME_VERTICAL_DISTANCE_MAX = 120
 LEADERBOARD_NAME_HORIZONTAL_TOLERANCE = 100
 MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
 IMAGE_DOWNLOAD_TIMEOUT = 30.0  # seconds
+OCR_SCALE_FACTOR = 1.5  # Reduced from 2.0 for faster processing
+MAX_IMAGE_DIMENSION = 3840  # Downscale images larger than 4K
+
+# Pre-compile regex patterns for better performance
+NUMBER_PATTERN = re.compile(r'\D')
+TEXT_PATTERN = re.compile(r'[^\w\s]')
 
 # Rate limiting: user_id -> list of timestamps
 rate_limit_tracker: Dict[int, List[float]] = defaultdict(list)
@@ -99,27 +105,38 @@ class AnalysisResult:
     rank_name: str
     rank_score: int
 
-# Initialize EasyOCR Reader with error handling (lazy loading)
+# Initialize EasyOCR Reader (will be loaded during bot startup)
 reader = None
 
 def get_ocr_reader():
-    """Lazy load OCR reader to prevent blocking bot startup."""
+    """Get the initialized OCR reader."""
     global reader
     if reader is None:
+        raise RuntimeError("OCR reader not initialized. This should not happen after bot startup.")
+    return reader
+
+async def initialize_ocr_reader():
+    """Initialize OCR reader asynchronously during bot startup."""
+    global reader
+    if reader is None:
+        loop = asyncio.get_running_loop()
         try:
-            reader = easyocr.Reader(['en'], gpu=False)
+            # Run blocking OCR initialization in executor
+            reader = await loop.run_in_executor(
+                None,
+                lambda: easyocr.Reader(['en'], gpu=False)
+            )
             print("✅ EasyOCR reader initialized successfully")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize EasyOCR reader: {str(e)}")
-    return reader
 
 # Setup Discord Bot
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
-# ThreadPoolExecutor with proper cleanup
-executor = ThreadPoolExecutor(max_workers=2)
+# ThreadPoolExecutor with proper cleanup - increased workers for parallel processing
+executor = ThreadPoolExecutor(max_workers=4)
 
 def cleanup_executor():
     """Cleanup executor on shutdown."""
@@ -193,53 +210,260 @@ def check_rate_limit(user_id: int) -> Tuple[bool, int]:
     rate_limit_tracker[user_id].append(now)
     return True, 0
 
+def get_game_date(dt: datetime) -> str:
+    """
+    Calculate the game date based on 8am GMT+2 reset time.
+    If current time is before 8am GMT+2, the game date is yesterday.
+    
+    Args:
+        dt: datetime object (assumed to be in UTC or local time)
+        
+    Returns:
+        ISO date string for the game day (YYYY-MM-DD)
+    """
+    from datetime import timedelta, timezone
+    
+    # Convert to GMT+2 (SAST - South African Standard Time)
+    gmt_plus_2 = timezone(timedelta(hours=2))
+    dt_gmt2 = dt.astimezone(gmt_plus_2)
+    
+    # If before 8am, the game day is yesterday
+    if dt_gmt2.hour < 8:
+        game_date = (dt_gmt2.date() - timedelta(days=1)).isoformat()
+    else:
+        game_date = dt_gmt2.date().isoformat()
+    
+    return game_date
+
+def get_user_daily_history(username: str, days: int = 30) -> List[Dict]:
+    """
+    Get user's daily HighestToday history for line graphs.
+    
+    Args:
+        username: Discord username
+        days: Number of days to retrieve (default 30)
+        
+    Returns:
+        List of dicts with GameDate and BestHighestToday
+    """
+    try:
+        from datetime import timedelta
+        
+        response = table.query(
+            KeyConditionExpression='PK = :pk AND begins_with(SK, :sk)',
+            ExpressionAttributeValues={
+                ':pk': f'USER#{username}',
+                ':sk': 'DAILY#'
+            },
+            ScanIndexForward=False,  # Sort descending (newest first)
+            Limit=days
+        )
+        
+        return [{
+            'date': item['GameDate'],
+            'score': item['BestHighestToday']
+        } for item in response.get('Items', [])]
+    except Exception as e:
+        print(f"❌ Error fetching user history: {str(e)}")
+        return []
+
+def get_club_weekly_history(club_name: str, weeks: int = 12) -> List[Dict]:
+    """
+    Get club's weekly MaxTotalPower history for line graphs.
+    
+    Args:
+        club_name: Club name
+        weeks: Number of weeks to retrieve (default 12)
+        
+    Returns:
+        List of dicts with GameWeek and MaxTotalPower
+    """
+    try:
+        response = table.query(
+            KeyConditionExpression='PK = :pk AND begins_with(SK, :sk)',
+            ExpressionAttributeValues={
+                ':pk': f'CLUB#{club_name}',
+                ':sk': 'WEEKLY#'
+            },
+            ScanIndexForward=False,  # Sort descending (newest first)
+            Limit=weeks
+        )
+        
+        return [{
+            'week': item['GameWeek'],
+            'power': item['MaxTotalPower']
+        } for item in response.get('Items', [])]
+    except Exception as e:
+        print(f"❌ Error fetching club history: {str(e)}")
+        return []
+
+def get_game_week(dt: datetime) -> str:
+    """
+    Calculate the game week identifier based on Monday 8am GMT+2 reset.
+    Week format: "YYYY-Wnn" (e.g., "2025-W49")
+    
+    Args:
+        dt: datetime object
+        
+    Returns:
+        ISO week string (YYYY-Wnn)
+    """
+    from datetime import timedelta, timezone
+    
+    # Convert to GMT+2
+    gmt_plus_2 = timezone(timedelta(hours=2))
+    dt_gmt2 = dt.astimezone(gmt_plus_2)
+    
+    # Adjust for 8am reset
+    if dt_gmt2.hour < 8:
+        adjusted_date = dt_gmt2.date() - timedelta(days=1)
+    else:
+        adjusted_date = dt_gmt2.date()
+    
+    # Adjust for Monday reset
+    # ISO weekday: Monday=1, Sunday=7
+    weekday = adjusted_date.isoweekday()
+    if weekday == 1 and dt_gmt2.hour < 8:
+        # If it's Monday before 8am, we're still in last week
+        adjusted_date = adjusted_date - timedelta(days=1)
+    
+    # Get ISO week number
+    year, week, _ = adjusted_date.isocalendar()
+    return f"{year}-W{week:02d}"
+
 def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int,
                      weekly_score: int, total_power: int, username: str) -> dict:
     """
-    Creates a submission entry in DynamoDB.
+    Creates a submission entry in DynamoDB with new PK/SK schema.
+    Also updates daily and weekly summaries for both user and club in real-time.
+    
+    Game Time Rules:
+    - Daily reset: 8am GMT+2 (SAST)
+    - Weekly reset: Monday 8am GMT+2 (SAST)
+    
+    New Schema:
+    - Raw Submission: PK="USER#{username}", SK="SUBMISSION#{iso_datetime}"
+    - User Daily: PK="USER#{username}", SK="DAILY#{game_date}"
+    - Club Weekly: PK="CLUB#{club_name}", SK="WEEKLY#{week_id}"
     
     Args:
         datetime_obj: The datetime of the submission
-        club_name: Name of the club (Partition Key)
-        highest_today: Highest score today
-        weekly_score: Weekly score
-        total_power: Total power
+        club_name: Name of the club
+        highest_today: Highest score today (for user daily tracking)
+        weekly_score: Weekly score (not used in summaries currently)
+        total_power: Total power (for club weekly tracking)
         username: Discord username
         
     Returns:
-        dict: Response from DynamoDB put_item operation
+        dict: Response with success status and any errors
     """
     try:
-        # Use ISO datetime as sort key for easy date-range queries
-        # ISO format naturally sorts chronologically and supports begins_with, between
-        datetime_str = datetime_obj.isoformat()
+        iso_datetime = datetime_obj.isoformat()
+        game_date = get_game_date(datetime_obj)
+        game_week = get_game_week(datetime_obj)
         
-        # Prepare item for DynamoDB
-        # Schema: ClubName (Partition Key) + DateTime (Sort Key)
-        # This allows efficient queries like:
-        # - All submissions for a club
-        # - Submissions within a date range
-        # - Latest submissions (reverse sort)
-        # - Today's submissions (begins_with)
-        item = {
-            'ClubName': club_name,           # Partition Key
-            'DateTime': datetime_str,        # Sort Key: ISO format for chronological sorting
+        errors = []
+        
+        # ==========================================
+        # 1. STORE RAW USER SUBMISSION
+        # ==========================================
+        user_submission = {
+            'PK': f'USER#{username}',
+            'SK': f'SUBMISSION#{iso_datetime}',
+            'ClubName': club_name,
             'HighestToday': highest_today,
             'WeeklyScore': weekly_score,
             'TotalPower': total_power,
-            'Username': username,
-            'EntryType': 'Submission'
+            'DateTime': iso_datetime,
+            'GameDate': game_date,
+            'GameWeek': game_week,
+            'EntryType': 'UserSubmission'
         }
         
-        # Put item into DynamoDB with error handling
-        response = table.put_item(Item=item)
+        try:
+            table.put_item(Item=user_submission)
+            print(f"✅ Stored user submission: {username} at {iso_datetime} (game date: {game_date})")
+        except Exception as e:
+            errors.append(f"User submission failed: {str(e)}")
+            print(f"❌ Failed to store user submission: {str(e)}")
+        
+        # ==========================================
+        # 2. UPDATE USER DAILY SUMMARY (Optimized with conditional update)
+        # ==========================================
+        try:
+            # Use update_item with condition to avoid GET request
+            table.update_item(
+                Key={
+                    'PK': f'USER#{username}',
+                    'SK': f'DAILY#{game_date}'
+                },
+                UpdateExpression='SET BestHighestToday = if_not_exists(BestHighestToday, :zero), ClubName = :club, GameDate = :date, LastUpdated = :updated, EntryType = :type SET BestHighestToday = if_not_exists(BestHighestToday, :zero) SET BestHighestToday = :new_score',
+                ConditionExpression='attribute_not_exists(BestHighestToday) OR BestHighestToday < :new_score',
+                ExpressionAttributeValues={
+                    ':new_score': highest_today,
+                    ':zero': 0,
+                    ':club': club_name,
+                    ':date': game_date,
+                    ':updated': iso_datetime,
+                    ':type': 'UserDailySummary'
+                }
+            )
+            print(f"✅ Updated user daily summary: {username} on {game_date} - new best {highest_today}")
+        except table.meta.client.exceptions.ConditionalCheckFailedException:
+            print(f"ℹ️ User daily not updated: score {highest_today} not higher than current best")
+        except Exception as e:
+            errors.append(f"User daily update failed: {str(e)}")
+            print(f"❌ Failed to update user daily: {str(e)}")
+        
+        # ==========================================
+        # 3. UPDATE CLUB WEEKLY SUMMARY (Optimized with conditional update)
+        # ==========================================
+        try:
+            # Use update_item with condition to avoid GET request
+            table.update_item(
+                Key={
+                    'PK': f'CLUB#{club_name}',
+                    'SK': f'WEEKLY#{game_week}'
+                },
+                UpdateExpression='SET MaxTotalPower = if_not_exists(MaxTotalPower, :zero), GameWeek = :week, LastUpdated = :updated, EntryType = :type SET MaxTotalPower = :new_power',
+                ConditionExpression='attribute_not_exists(MaxTotalPower) OR MaxTotalPower < :new_power',
+                ExpressionAttributeValues={
+                    ':new_power': total_power,
+                    ':zero': 0,
+                    ':week': game_week,
+                    ':updated': iso_datetime,
+                    ':type': 'ClubWeeklySummary'
+                }
+            )
+            print(f"✅ Updated club weekly summary: {club_name} week {game_week} - new max {total_power}")
+        except table.meta.client.exceptions.ConditionalCheckFailedException:
+            print(f"ℹ️ Club weekly not updated: power {total_power} not higher than current max")
+        except Exception as e:
+            errors.append(f"Club weekly update failed: {str(e)}")
+            print(f"❌ Failed to update club weekly: {str(e)}")
+        
+        # ==========================================
+        # RETURN RESULTS
+        # ==========================================
+        if errors:
+            return {
+                'success': False,
+                'partial': True,
+                'errors': errors,
+                'username': username,
+                'club_name': club_name,
+                'datetime': iso_datetime
+            }
         
         return {
             'success': True,
-            'response': response,
+            'username': username,
             'club_name': club_name,
-            'datetime': datetime_str
+            'datetime': iso_datetime,
+            'game_date': game_date,
+            'game_week': game_week
         }
+        
     except Exception as e:
         print(f"❌ DynamoDB write error: {str(e)}")
         return {
@@ -249,7 +473,7 @@ def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int,
 
 def clean_text(text: str, is_number: bool = False) -> Union[int, str]:
     """
-    Clean text extracted from OCR.
+    Clean text extracted from OCR (optimized with pre-compiled regex).
     
     Args:
         text: Raw text from OCR
@@ -263,10 +487,10 @@ def clean_text(text: str, is_number: bool = False) -> Union[int, str]:
     
     if is_number:
         text = text.replace('S', '5').replace('O', '0').replace('o', '0').replace('I', '1').replace('l', '1')
-        clean = re.sub(r'\D', '', text)
+        clean = NUMBER_PATTERN.sub('', text)
         return int(clean) if clean else 0
     
-    clean = re.sub(r'[^\w\s]', '', text).strip()
+    clean = TEXT_PATTERN.sub('', text).strip()
     return clean
 
 async def get_guild_nick(interaction: discord.Interaction) -> Optional[str]:
@@ -327,18 +551,31 @@ def get_anchored_roi(image: np.ndarray, ref_rect: tuple, anchor_x: str, anchor_y
     
     return image[new_y:new_y+new_h, new_x:new_x+new_w], (new_x, new_y, new_w, new_h)
 
+def preprocess_roi(roi: np.ndarray, scale: float = OCR_SCALE_FACTOR) -> np.ndarray:
+    """
+    Preprocess ROI for OCR (optimized to avoid redundant operations).
+    
+    Args:
+        roi: Input image ROI
+        scale: Upscaling factor
+        
+    Returns:
+        Preprocessed image ready for OCR
+    """
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    upscaled = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(upscaled)
+    return enhanced
+
 def ocr_static_roi(roi: np.ndarray, is_number: bool) -> str:
-    """Simple OCR for the static box."""
+    """Simple OCR for the static box (optimized)."""
     if roi is None or roi.size == 0:
         return ""
     
     try:
         ocr_reader = get_ocr_reader()
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        scale = 2
-        upscaled = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(upscaled)
+        enhanced = preprocess_roi(roi)
         allowlist = '0123456789' if is_number else None
         results = ocr_reader.readtext(enhanced, detail=0, allowlist=allowlist, paragraph=True)
         return " ".join(results)
@@ -348,7 +585,7 @@ def ocr_static_roi(roi: np.ndarray, is_number: bool) -> str:
 
 def scan_zone(image: np.ndarray, zone_bbox: tuple) -> List[OCREntry]:
     """
-    Scans a dynamic zone and returns all text with coordinates.
+    Scans a dynamic zone and returns all text with coordinates (optimized).
     
     Returns:
         List of OCREntry objects
@@ -360,18 +597,16 @@ def scan_zone(image: np.ndarray, zone_bbox: tuple) -> List[OCREntry]:
     try:
         ocr_reader = get_ocr_reader()
         roi = image[y:y+h, x:x+w]
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        scale = 2
-        upscaled = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        enhanced = preprocess_roi(roi)
         
-        results = ocr_reader.readtext(upscaled, detail=1)
+        results = ocr_reader.readtext(enhanced, detail=1)
         
         entries = []
         for (bbox, text, prob) in results:
             local_cx = (bbox[0][0] + bbox[1][0]) / 2
             local_cy = (bbox[0][1] + bbox[2][1]) / 2
-            global_cx = (local_cx / scale) + x
-            global_cy = (local_cy / scale) + y
+            global_cx = (local_cx / OCR_SCALE_FACTOR) + x
+            global_cy = (local_cy / OCR_SCALE_FACTOR) + y
             
             entries.append(OCREntry(
                 raw_text=text,
@@ -438,16 +673,37 @@ def find_leaderboard_name_and_score(lb_entries: List[OCREntry], scale_x: float, 
     
     return lb_name, lb_score
 
-def analyze_screenshot(image_bytes: bytes, debug: bool = False) -> AnalysisResult:
-    """Analyze screenshot and extract game data."""
-    if not image_bytes:
-        raise ValueError("No image data provided")
+def downscale_if_needed(image: np.ndarray) -> np.ndarray:
+    """
+    Downscale image if it's too large for efficient processing.
     
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Could not decode image - file may be corrupted or invalid format")
+    Args:
+        image: Input image
+        
+    Returns:
+        Downscaled image if needed, otherwise original
+    """
+    h, w = image.shape[:2]
+    max_dim = max(h, w)
+    
+    if max_dim > MAX_IMAGE_DIMENSION:
+        scale = MAX_IMAGE_DIMENSION / max_dim
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    return image
 
+def process_static_score(img: np.ndarray) -> Tuple[int, Optional[Tuple[int, int, int, int]]]:
+    """Process static center score ROI."""
+    config = STATIC_ROIS["CENTER_SCORE_ROI"]
+    roi, coords = get_anchored_roi(img, config['rect'], config['anchor_x'], config['anchor_y'])
+    raw_score = ocr_static_roi(roi, is_number=True)
+    daily_high = clean_text(raw_score, is_number=True)
+    return daily_high, coords
+
+def process_power_zone(img: np.ndarray) -> Tuple[int, Tuple[int, int, int, int]]:
+    """Process power zone (bottom left)."""
     h, w = img.shape[:2]
     scale_x, scale_y = calculate_scale_from_image(img)
     
@@ -459,49 +715,35 @@ def analyze_screenshot(image_bytes: bytes, debug: bool = False) -> AnalysisResul
     
     debug_img = img.copy() if debug else None
 
-    # 1. CENTER HIGH SCORE -> USE STATIC ROI
-    config = STATIC_ROIS["CENTER_SCORE_ROI"]
-    roi, coords = get_anchored_roi(img, config['rect'], config['anchor_x'], config['anchor_y'])
+    # PARALLEL PROCESSING: Process all three zones concurrently
+    loop = asyncio.new_event_loop()
     
-    raw_score = ocr_static_roi(roi, is_number=True)
-    daily_high = clean_text(raw_score, is_number=True)
+    # Submit all tasks to executor for parallel processing
+    future_score = loop.run_in_executor(executor, process_static_score, img)
+    future_power = loop.run_in_executor(executor, process_power_zone, img)
+    future_leaderboard = loop.run_in_executor(executor, process_leaderboard_zone, img, scale_x, scale_y)
     
-    if debug and coords:
-        rx, ry, rw, rh = coords
-        cv2.rectangle(debug_img, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
+    # Wait for all results
+    daily_high, score_coords = loop.run_until_complete(future_score)
+    found_power, power_zone = loop.run_until_complete(future_power)
+    lb_name, lb_score, lb_zone = loop.run_until_complete(future_leaderboard)
+    
+    loop.close()
 
-    # 2. TOTAL POWER -> USE SMART ZONE (Bottom Left)
-    zp_x, zp_y = 0, int(h * 0.85)
-    zp_w, zp_h = int(w * 0.40), h - zp_y
-    
-    power_entries = scan_zone(img, (zp_x, zp_y, zp_w, zp_h))
-    valid_power = [e for e in power_entries if e.number > MIN_POWER_THRESHOLD]
-    
-    found_power = 0
-    if valid_power:
-        valid_power.sort(key=lambda k: k.cx)
-        found_power = valid_power[0].number
+    # Debug visualization if requested
+    if debug and debug_img is not None:
+        # Draw static ROI
+        if score_coords:
+            rx, ry, rw, rh = score_coords
+            cv2.rectangle(debug_img, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
         
-        if debug:
-            cv2.circle(debug_img, (int(valid_power[0].cx), int(valid_power[0].cy)), 10, (0, 0, 255), -1)
-
-    if debug:
+        # Draw power zone
+        zp_x, zp_y, zp_w, zp_h = power_zone
         cv2.rectangle(debug_img, (zp_x, zp_y), (zp_x+zp_w, zp_y+zp_h), (0, 0, 255), 2)
-
-    # 3. LEADERBOARD -> USE SMART ZONE (Bottom Right)
-    zl_x, zl_y = int(w * 0.65), int(h * 0.60)
-    zl_w, zl_h = w - zl_x, h - zl_y
-    
-    lb_entries = scan_zone(img, (zl_x, zl_y, zl_w, zl_h))
-    lb_name, lb_score = find_leaderboard_name_and_score(lb_entries, scale_x, scale_y)
-    
-    if debug:
+        
+        # Draw leaderboard zone
+        zl_x, zl_y, zl_w, zl_h = lb_zone
         cv2.rectangle(debug_img, (zl_x, zl_y), (zl_x+zl_w, zl_y+zl_h), (255, 0, 0), 2)
-        # Mark detected score
-        for entry in lb_entries:
-            if entry.number == lb_score:
-                cv2.circle(debug_img, (int(entry.cx), int(entry.cy)), 10, (255, 0, 0), -1)
-                break
         
         try:
             cv2.imwrite(debug_path, debug_img)
@@ -520,341 +762,41 @@ def analyze_screenshot(image_bytes: bytes, debug: bool = False) -> AnalysisResul
         result.debug_path = debug_path  # type: ignore
     
     return result
+    zp_x, zp_y = 0, int(h * 0.85)
+    zp_w, zp_h = int(w * 0.40), h - zp_y
+    
+    power_entries = scan_zone(img, (zp_x, zp_y, zp_w, zp_h))
+    valid_power = [e for e in power_entries if e.number > MIN_POWER_THRESHOLD]
+    
+    found_power = 0
+    if valid_power:
+        valid_power.sort(key=lambda k: k.cx)
+        found_power = valid_power[0].number
+    
+    return found_power, (zp_x, zp_y, zp_w, zp_h)
 
-@bot.event
-async def on_ready():
-    print(f'✅ {bot.user} has connected!')
-    try:
-        await bot.tree.sync()
-        print("✅ Slash commands synced.")
-    except Exception as e:
-        print(f"❌ Sync failed: {e}")
+def process_leaderboard_zone(img: np.ndarray, scale_x: float, scale_y: float) -> Tuple[str, int, Tuple[int, int, int, int]]:
+    """Process leaderboard zone (bottom right)."""
+    h, w = img.shape[:2]
+    zl_x, zl_y = int(w * 0.65), int(h * 0.60)
+    zl_w, zl_h = w - zl_x, h - zl_y
+    
+    lb_entries = scan_zone(img, (zl_x, zl_y, zl_w, zl_h))
+    lb_name, lb_score = find_leaderboard_name_and_score(lb_entries, scale_x, scale_y)
+    
+    return lb_name, lb_score, (zl_x, zl_y, zl_w, zl_h)
 
-@bot.tree.command(name="activatecontestsubmissions", description="Activate contest submissions in this channel (Moderator only)")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def activate_channel(interaction: discord.Interaction, role: discord.Role):
-    """Activate contest submissions for this channel with a specific role."""
-    if interaction.guild is None:
-        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
-        return
+def analyze_screenshot(image_bytes: bytes, debug: bool = False) -> AnalysisResult:
+    """Analyze screenshot and extract game data (optimized with parallel processing)."""
+    if not image_bytes:
+        raise ValueError("No image data provided")
     
-    channel_key = (interaction.guild.id, interaction.channel.id)
-    
-    if channel_key in activated_channels:
-        old_role = activated_channels[channel_key]
-        activated_channels[channel_key] = role.name
-        save_activated_channels()
-        await interaction.response.send_message(
-            f"✅ Contest submissions in this channel have been updated!\n"
-            f"**Previous Role:** {old_role}\n"
-            f"**New Role:** {role.mention}\n"
-            f"Users can now use `/submit` and `/calibrate` commands here.",
-            ephemeral=False
-        )
-    else:
-        activated_channels[channel_key] = role.name
-        save_activated_channels()
-        await interaction.response.send_message(
-            f"✅ Contest submissions are now **activated** in this channel!\n"
-            f"**Associated Role:** {role.mention}\n"
-            f"Users can now use `/submit` and `/calibrate` commands here.",
-            ephemeral=False
-        )
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Could not decode image - file may be corrupted or invalid format")
 
-@bot.tree.command(name="deactivatecontestsubmissions", description="Deactivate contest submissions in this channel (Moderator only)")
-@app_commands.checks.has_permissions(moderate_members=True)
-async def deactivate_channel(interaction: discord.Interaction):
-    """Deactivate contest submissions for this channel."""
-    if interaction.guild is None:
-        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
-        return
+    # Downscale if needed for faster processing
+    img = downscale_if_needed(img)
     
-    channel_key = (interaction.guild.id, interaction.channel.id)
-    
-    if channel_key not in activated_channels:
-        await interaction.response.send_message(
-            "❌ Contest submissions are not currently activated in this channel.",
-            ephemeral=True
-        )
-        return
-    
-    role_name = activated_channels[channel_key]
-    del activated_channels[channel_key]
-    save_activated_channels()
-    
-    await interaction.response.send_message(
-        f"✅ Contest submissions have been **deactivated** in this channel!\n"
-        f"**Previous Role:** {role_name}\n"
-        f"Users can no longer use `/submit` and `/calibrate` commands here.",
-        ephemeral=False
-    )
-
-@activate_channel.error
-async def activate_channel_error(interaction: discord.Interaction, error):
-    """Handle permission errors for the activate command."""
-    if isinstance(error, app_commands.errors.MissingPermissions):
-        await interaction.response.send_message(
-            "❌ You need moderator permissions to manage contest submissions.",
-            ephemeral=True
-        )
-
-@deactivate_channel.error
-async def deactivate_channel_error(interaction: discord.Interaction, error):
-    """Handle permission errors for the deactivate command."""
-    if isinstance(error, app_commands.errors.MissingPermissions):
-        await interaction.response.send_message(
-            "❌ You need moderator permissions to manage contest submissions.",
-            ephemeral=True
-        )
-
-@bot.tree.command(name="submit", description="Submit a screenshot for scoring")
-async def submit(interaction: discord.Interaction, image: discord.Attachment):
-    """Submit a screenshot for contest scoring."""
-    # Check rate limit
-    is_allowed, seconds_until_reset = check_rate_limit(interaction.user.id)
-    if not is_allowed:
-        minutes = seconds_until_reset // 60
-        await interaction.response.send_message(
-            f"⏱️ You've reached the submission limit. Please try again in {minutes} minutes.",
-            ephemeral=True
-        )
-        return
-    
-    # Check if channel is activated
-    if interaction.guild is None:
-        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
-        return
-    
-    channel_key = (interaction.guild.id, interaction.channel.id)
-    if channel_key not in activated_channels:
-        await interaction.response.send_message(
-            "❌ Contest submissions are not activated in this channel.\n"
-            "A moderator needs to use `/activatecontestsubmissions @role` first.",
-            ephemeral=True
-        )
-        return
-    
-    # Validate image
-    if not image.content_type or not image.content_type.startswith('image/'):
-        await interaction.response.send_message("❌ Please upload a valid image file.", ephemeral=True)
-        return
-    
-    if image.size > MAX_IMAGE_SIZE:
-        await interaction.response.send_message(
-            f"❌ Image too large. Maximum size is {MAX_IMAGE_SIZE // (1024*1024)}MB.",
-            ephemeral=True
-        )
-        return
-    
-    channel_role = activated_channels[channel_key]
-    
-    await interaction.response.defer()
-    
-    try:
-        # Download image with timeout
-        image_data = await asyncio.wait_for(image.read(), timeout=IMAGE_DOWNLOAD_TIMEOUT)
-        
-        if not image_data:
-            await interaction.followup.send("❌ Failed to download image data.", ephemeral=True)
-            return
-        
-        loop = asyncio.get_running_loop()
-        result: AnalysisResult = await loop.run_in_executor(executor, analyze_screenshot, image_data, False)
-        
-        embed = discord.Embed(title="🎮 Contest Entry Processed", color=discord.Color.gold())
-        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-        
-        embed.add_field(
-            name="🏆 Daily High Score",
-            value=f"```yaml\n{result.daily_high:,}```",
-            inline=True
-        )
-        embed.add_field(
-            name="⚡ Total Power",
-            value=f"```yaml\n{result.total_power:,}```",
-            inline=True
-        )
-        embed.add_field(name="\u200b", value="**Leaderboard Validation**", inline=False)
-        embed.add_field(
-            name="👤 Name Detected",
-            value=f"{result.rank_name}",
-            inline=True
-        )
-        embed.add_field(
-            name="📊 Leaderboard Score",
-            value=f"{result.rank_score:,}",
-            inline=True
-        )
-        embed.set_thumbnail(url=image.url)
-        
-        # Compare detected leaderboard name with server nickname
-        detected_name = clean_text(result.rank_name, is_number=False)
-
-        guild_nick = await get_guild_nick(interaction)
-        if guild_nick is None:
-            match_text = "⚠️ No server nickname set"
-            embed.add_field(
-                name="⚠️ Validation Issue",
-                value="You must set a server nickname that matches your in-game name to submit scores.",
-                inline=False
-            )
-        else:
-            nick_clean = clean_text(guild_nick, is_number=False)
-            names_match = nick_clean.lower() == detected_name.lower()
-            match_text = "✅ Match" if names_match else "❌ Mismatch"
-            
-            if not names_match:
-                embed.add_field(
-                    name="⚠️ Name Mismatch",
-                    value=f"Your server nickname `{guild_nick}` doesn't match the detected name `{result.rank_name}`. Please update your nickname to match your in-game name.",
-                    inline=False
-                )
-
-        embed.add_field(name="👥 Server Nickname", value=guild_nick or "—", inline=True)
-        embed.add_field(name="🔎 Detected Name", value=result.rank_name or "—", inline=True)
-        embed.add_field(name="✅ Nickname Match", value=match_text, inline=False)
-        embed.add_field(name="🏷️ Channel Role", value=channel_role, inline=False)
-
-        # Create submission in DynamoDB if names match AND scores are valid
-        should_save = False
-        save_reason = ""
-        
-        if guild_nick is None:
-            save_reason = "❌ Not saved - no server nickname set"
-        else:
-            nick_clean = clean_text(guild_nick, is_number=False)
-            if nick_clean.lower() != detected_name.lower():
-                save_reason = "❌ Not saved - nickname mismatch"
-            elif result.daily_high == 0 and result.rank_score == 0:
-                save_reason = "❌ Not saved - no valid scores detected"
-            else:
-                should_save = True
-        
-        if should_save:
-            submission_result = createSubmission(
-                datetime_obj=datetime.now(),
-                club_name=channel_role,
-                highest_today=result.daily_high,
-                weekly_score=result.rank_score,
-                total_power=result.total_power,
-                username=guild_nick
-            )
-            
-            if submission_result['success']:
-                embed.add_field(
-                    name="💾 Database",
-                    value="✅ Submission saved successfully!",
-                    inline=False
-                )
-            else:
-                embed.add_field(
-                    name="💾 Database",
-                    value=f"⚠️ Failed to save: {submission_result.get('error', 'Unknown error')}",
-                    inline=False
-                )
-        else:
-            embed.add_field(
-                name="💾 Database",
-                value=save_reason,
-                inline=False
-            )
-
-        await interaction.followup.send(embed=embed)
-
-    except asyncio.TimeoutError:
-        await interaction.followup.send("❌ Image download timed out. Please try again.", ephemeral=True)
-    except ValueError as e:
-        await interaction.followup.send(f"❌ {str(e)}", ephemeral=True)
-    except Exception as e:
-        print(f"❌ Unexpected error in submit: {str(e)}")
-        await interaction.followup.send(
-            "❌ An error occurred while processing your image. Please ensure you've uploaded a clear screenshot and try again.",
-            ephemeral=True
-        )
-
-@bot.tree.command(name="calibrate", description="Debug view: Green=Static, Red=PowerZone, Blue=LeaderboardZone")
-async def calibrate(interaction: discord.Interaction, image: discord.Attachment):
-    """Show debug visualization of OCR regions."""
-    if interaction.guild is None:
-        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
-        return
-    
-    channel_key = (interaction.guild.id, interaction.channel.id)
-    if channel_key not in activated_channels:
-        await interaction.response.send_message(
-            "❌ Contest submissions are not activated in this channel.\n"
-            "A moderator needs to use `/activatecontestsubmissions @role` first.",
-            ephemeral=True
-        )
-        return
-    
-    # Validate image
-    if not image.content_type or not image.content_type.startswith('image/'):
-        await interaction.response.send_message("❌ Please upload a valid image file.", ephemeral=True)
-        return
-    
-    if image.size > MAX_IMAGE_SIZE:
-        await interaction.response.send_message(
-            f"❌ Image too large. Maximum size is {MAX_IMAGE_SIZE // (1024*1024)}MB.",
-            ephemeral=True
-        )
-        return
-    
-    await interaction.response.defer()
-    
-    debug_path = None
-    try:
-        image_data = await asyncio.wait_for(image.read(), timeout=IMAGE_DOWNLOAD_TIMEOUT)
-        
-        if not image_data:
-            await interaction.followup.send("❌ Failed to download image data.", ephemeral=True)
-            return
-        
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(executor, analyze_screenshot, image_data, True)
-        
-        debug_path = getattr(result, 'debug_path', None)
-        
-        if debug_path and os.path.exists(debug_path):
-            f = discord.File(debug_path, filename="calibration.png")
-            embed = discord.Embed(title="🎯 Calibration Debug", color=discord.Color.blurple())
-            embed.description = (
-                "**Legend:**\n"
-                "🟢 Green: Daily High Score ROI\n"
-                "🔴 Red: Total Power Zone\n"
-                "🔵 Blue: Leaderboard Zone"
-            )
-            embed.set_image(url="attachment://calibration.png")
-            await interaction.followup.send(embed=embed, file=f)
-        else:
-            await interaction.followup.send("❌ Failed to generate debug image.", ephemeral=True)
-    except asyncio.TimeoutError:
-        await interaction.followup.send("❌ Image download timed out. Please try again.", ephemeral=True)
-    except Exception as e:
-        print(f"❌ Error in calibrate: {str(e)}")
-        await interaction.followup.send("❌ An error occurred during calibration. Please try again.", ephemeral=True)
-    finally:
-        # Clean up temporary file
-        if debug_path and os.path.exists(debug_path):
-            try:
-                os.remove(debug_path)
-            except Exception as e:
-                print(f"⚠️ Could not delete debug file: {str(e)}")
-
-def main():
-    """Main entry point for the bot."""
-    if not DISCORD_TOKEN:
-        print("❌ Error: DISCORD_BOT_TOKEN not found in environment variables")
-        return
-    
-    try:
-        bot.run(DISCORD_TOKEN)
-    except KeyboardInterrupt:
-        print("\n✅ Bot shutdown requested")
-    except Exception as e:
-        print(f"❌ Fatal error: {str(e)}")
-    finally:
-        cleanup_executor()
-
-if __name__ == "__main__":
-    main()
+    h, w = img.shape[:2]

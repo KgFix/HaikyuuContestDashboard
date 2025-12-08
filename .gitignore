@@ -1,45 +1,48 @@
-# Firebase build and deployment files
-/firebase-debug.log
-/firebase-debug.*.log
-.firebaserc
-
-# Firebase Hosting
-/firebase.json
-*.cache
-hosting/.cache
-
-# Firebase Functions
-/functions/node_modules/
-/functions/.env
-/functions/package-lock.json
-
-# Firebase Emulators
-/firebase-*.zip
-/.firebase/
-/emulator-ui/
-
-# Logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Environment files (local configs)
+# Environment files
 .env
 .env.*
-/backend/.env
-/backend/.env.*
-/frontend/my-app/.env
-/frontend/my-app/.env.*
- 
-# Python virtual environments & caches
-/backend/.venv/
-venv/
-ENV/
-env/
+
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .Python
+*.so
+.venv/
+venv/
+ENV/
+env/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Backend specific
+backend/.env
+backend/.venv/
+backend/__pycache__/
+
+# Frontend specific
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.*
 

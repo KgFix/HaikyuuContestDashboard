@@ -1,6 +1,6 @@
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 from dotenv import load_dotenv
 import cv2
@@ -10,16 +10,25 @@ import re
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import boto3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dt_time
 from decimal import Decimal
 import uuid
 import atexit
+import sys
+import logging
 from typing import Optional, Union, Dict, List, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
 import time
 import json
 import tempfile
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
@@ -49,10 +58,11 @@ try:
     )
     table = dynamodb.Table(DYNAMODB_TABLE_NAME)
     table.load()
-    print(f"✅ Connected to DynamoDB table: {DYNAMODB_TABLE_NAME}")
+    logger.info(f"Connected to DynamoDB table: {DYNAMODB_TABLE_NAME}")
 except Exception as e:
     raise ConnectionError(f"Failed to connect to DynamoDB: {str(e)}")
 
+# Image processing constants
 REF_WIDTH = 2556
 REF_HEIGHT = 1179
 MIN_POWER_THRESHOLD = 10000
@@ -64,6 +74,19 @@ MAX_IMAGE_SIZE = 10 * 1024 * 1024
 IMAGE_DOWNLOAD_TIMEOUT = 30.0
 OCR_SCALE_FACTOR = 1.5
 MAX_IMAGE_DIMENSION = 3840
+
+# Image zone constants
+POWER_ZONE_Y_RATIO = 0.85
+POWER_ZONE_WIDTH_RATIO = 0.40
+LEADERBOARD_ZONE_X_RATIO = 0.65
+LEADERBOARD_ZONE_Y_RATIO = 0.60
+
+# DynamoDB key prefixes
+DDB_USER_PREFIX = 'USER#'
+DDB_CLUB_PREFIX = 'CLUB#'
+DDB_SUBMISSION_PREFIX = 'SUBMISSION#'
+DDB_DAILY_PREFIX = 'DAILY#'
+DDB_ACTIVITY_PREFIX = 'ACTIVITY#'
 
 NUMBER_PATTERN = re.compile(r'\D')
 TEXT_PATTERN = re.compile(r'[^\w\s]')
@@ -105,6 +128,7 @@ def get_ocr_reader():
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
 executor = ThreadPoolExecutor(max_workers=4)
@@ -112,41 +136,48 @@ executor = ThreadPoolExecutor(max_workers=4)
 def cleanup_executor():
     if executor and not executor._shutdown:
         executor.shutdown(wait=True)
-        print("✅ ThreadPoolExecutor shut down")
+        logger.info("ThreadPoolExecutor shut down")
 
 atexit.register(cleanup_executor)
 
 activated_channels = {}
-CHANNELS_STORAGE_FILE = "activated_channels.json"
+CHANNELS_STORAGE_FILE = os.getenv('CHANNELS_STORAGE_FILE', 'activated_channels.json')
 
-def load_activated_channels():
-    global activated_channels
+reminder_channels = {}
+REMINDERS_STORAGE_FILE = os.getenv('REMINDERS_STORAGE_FILE', 'reminder_channels.json')
+last_reminder_date = None
+
+def load_channels(filename: str) -> Dict[Tuple[int, int], str]:
+    """Load channel data from JSON file"""
     try:
-        if os.path.exists(CHANNELS_STORAGE_FILE):
-            with open(CHANNELS_STORAGE_FILE, 'r') as f:
+        if os.path.exists(filename):
+            with open(filename, 'r') as f:
                 data = json.load(f)
-                activated_channels = {
+                channels = {
                     tuple(map(int, k.split(','))): v 
                     for k, v in data.items()
                 }
-                print(f"✅ Loaded {len(activated_channels)} activated channels")
+                logger.info(f"Loaded {len(channels)} channels from {filename}")
+                return channels
     except Exception as e:
-        print(f"⚠️ Could not load activated channels: {str(e)}")
-        activated_channels = {}
+        logger.warning(f"Could not load channels from {filename}: {str(e)}")
+    return {}
 
-def save_activated_channels():
+def save_channels(channels: Dict[Tuple[int, int], str], filename: str) -> None:
+    """Save channel data to JSON file"""
     try:
         data = {
-            f"{guild_id},{channel_id}": role_name
-            for (guild_id, channel_id), role_name in activated_channels.items()
+            f"{guild_id},{channel_id}": value
+            for (guild_id, channel_id), value in channels.items()
         }
-        with open(CHANNELS_STORAGE_FILE, 'w') as f:
+        with open(filename, 'w') as f:
             json.dump(data, f, indent=2)
-        print(f"✅ Saved {len(activated_channels)} activated channels")
+        logger.info(f"Saved {len(channels)} channels to {filename}")
     except Exception as e:
-        print(f"⚠️ Could not save activated channels: {str(e)}")
+        logger.warning(f"Could not save channels to {filename}: {str(e)}")
 
-load_activated_channels()
+activated_channels = load_channels(CHANNELS_STORAGE_FILE)
+reminder_channels = load_channels(REMINDERS_STORAGE_FILE)
 
 def check_rate_limit(user_id: int) -> Tuple[bool, int]:
     now = time.time()
@@ -190,8 +221,9 @@ def get_game_week(dt: datetime) -> str:
     year, week, _ = adjusted_date.isocalendar()
     return f"{year}-W{week:02d}"
 
-def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int,
-                     weekly_score: int, total_power: int, username: str) -> dict:
+def create_submission(datetime_obj: datetime, club_name: str, highest_today: int,
+                      weekly_score: int, total_power: int, username: str) -> dict:
+    """Create submission entries in DynamoDB for user and club tracking"""
     try:
         iso_datetime = datetime_obj.isoformat()
         game_date = get_game_date(datetime_obj)
@@ -199,10 +231,10 @@ def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int,
         
         errors = []
         
-        # 1. User Submission (unchanged)
+        # 1. User Submission
         user_submission = {
-            'PK': f'USER#{username}',
-            'SK': f'SUBMISSION#{iso_datetime}',
+            'PK': f'{DDB_USER_PREFIX}{username}',
+            'SK': f'{DDB_SUBMISSION_PREFIX}{iso_datetime}',
             'ClubName': club_name,
             'HighestToday': highest_today,
             'WeeklyScore': weekly_score,
@@ -215,16 +247,17 @@ def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int,
         
         try:
             table.put_item(Item=user_submission)
-            print(f"✅ Stored user submission: {username}")
+            logger.info(f"Stored user submission: {username}")
         except Exception as e:
+            logger.error(f"User submission failed: {str(e)}")
             errors.append(f"User submission failed: {str(e)}")
         
-        # 2. User Daily Summary (unchanged)
+        # 2. User Daily Summary
         try:
             table.update_item(
                 Key={
-                    'PK': f'USER#{username}',
-                    'SK': f'DAILY#{game_date}'
+                    'PK': f'{DDB_USER_PREFIX}{username}',
+                    'SK': f'{DDB_DAILY_PREFIX}{game_date}'
                 },
                 UpdateExpression='SET BestHighestToday = if_not_exists(BestHighestToday, :score), ClubName = :club, GameDate = :date, GameWeek = :week, LastUpdated = :updated, EntryType = :type',
                 ConditionExpression='attribute_not_exists(BestHighestToday) OR BestHighestToday < :score',
@@ -237,18 +270,19 @@ def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int,
                     ':type': 'UserDailySummary'
                 }
             )
-            print(f"✅ Updated user daily: {username}")
+            logger.info(f"Updated user daily: {username}")
         except table.meta.client.exceptions.ConditionalCheckFailedException:
-            print(f"ℹ️ User daily not updated")
+            logger.debug(f"User daily not updated (no improvement): {username}")
         except Exception as e:
+            logger.error(f"User daily failed: {str(e)}")
             errors.append(f"User daily failed: {str(e)}")
         
-        # 3. NEW: Club Daily Summary (replaces Club Weekly Summary)
+        # 3. Club Daily Summary
         try:
             table.update_item(
                 Key={
-                    'PK': f'CLUB#{club_name}',
-                    'SK': f'DAILY#{game_date}'
+                    'PK': f'{DDB_CLUB_PREFIX}{club_name}',
+                    'SK': f'{DDB_DAILY_PREFIX}{game_date}'
                 },
                 UpdateExpression='SET MaxTotalPower = if_not_exists(MaxTotalPower, :power), GameDate = :date, GameWeek = :week, LastUpdated = :updated, EntryType = :type',
                 ConditionExpression='attribute_not_exists(MaxTotalPower) OR MaxTotalPower < :power',
@@ -260,37 +294,34 @@ def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int,
                     ':type': 'ClubDailySummary'
                 }
             )
-            print(f"✅ Updated club daily: {club_name}")
+            logger.info(f"Updated club daily: {club_name}")
         except table.meta.client.exceptions.ConditionalCheckFailedException:
-            print(f"ℹ️ Club daily not updated")
+            logger.debug(f"Club daily not updated (no improvement): {club_name}")
         except Exception as e:
+            logger.error(f"Club daily failed: {str(e)}")
             errors.append(f"Club daily failed: {str(e)}")
         
-        # 4. NEW: Club Daily User Activity Tracker
+        # 4. Club Daily User Activity Tracker
         try:
-            # First, get existing activity entry to merge user scores
             response = table.get_item(
                 Key={
-                    'PK': f'CLUB#{club_name}',
-                    'SK': f'ACTIVITY#{game_date}'
+                    'PK': f'{DDB_CLUB_PREFIX}{club_name}',
+                    'SK': f'{DDB_ACTIVITY_PREFIX}{game_date}'
                 }
             )
             
-            # Get existing users dict or create new one
             existing_users = {}
             if 'Item' in response and 'Users' in response['Item']:
                 existing_users = response['Item']['Users']
             
-            # Update or add this user's score (only if higher)
             current_score = existing_users.get(username, 0)
             if highest_today > current_score:
                 existing_users[username] = highest_today
             
-            # Put the updated activity entry
             table.put_item(
                 Item={
-                    'PK': f'CLUB#{club_name}',
-                    'SK': f'ACTIVITY#{game_date}',
+                    'PK': f'{DDB_CLUB_PREFIX}{club_name}',
+                    'SK': f'{DDB_ACTIVITY_PREFIX}{game_date}',
                     'Users': existing_users,
                     'GameDate': game_date,
                     'GameWeek': game_week,
@@ -298,8 +329,9 @@ def createSubmission(datetime_obj: datetime, club_name: str, highest_today: int,
                     'EntryType': 'ClubDailyActivity'
                 }
             )
-            print(f"✅ Updated club activity: {club_name} ({len(existing_users)} users)")
+            logger.info(f"Updated club activity: {club_name} ({len(existing_users)} users)")
         except Exception as e:
+            logger.error(f"Club activity failed: {str(e)}")
             errors.append(f"Club activity failed: {str(e)}")
         
         if errors:
@@ -327,6 +359,101 @@ def clean_text(text: str, is_number: bool = False) -> Union[int, str]:
     
     clean = TEXT_PATTERN.sub('', text).strip()
     return clean
+
+async def get_members_who_havent_submitted(guild: discord.Guild, channel: discord.TextChannel, club_name: str, game_date: str) -> List[discord.Member]:
+    """Get list of members in channel who haven't submitted for the day"""
+    try:
+        response = table.get_item(
+            Key={
+                'PK': f'{DDB_CLUB_PREFIX}{club_name}',
+                'SK': f'{DDB_ACTIVITY_PREFIX}{game_date}'
+            }
+        )
+        
+        submitted_users = set()
+        if 'Item' in response and 'Users' in response['Item']:
+            submitted_users = set(response['Item']['Users'].keys())
+        
+        members_to_ping = []
+        async for member in guild.fetch_members(limit=None):
+            if member.bot:
+                continue
+            
+            permissions = channel.permissions_for(member)
+            if not permissions.view_channel:
+                continue
+            
+            member_name = member.nick if member.nick else member.display_name
+            
+            if member_name not in submitted_users:
+                members_to_ping.append(member)
+        
+        return members_to_ping
+        
+    except Exception as e:
+        logger.error(f"Error getting non-submitters: {str(e)}")
+        return []
+
+@tasks.loop(minutes=30)
+async def check_reminder_schedule():
+    """Check if it's time to send reminders (Mon, Wed, Fri, Sat, Sun at 8 PM GMT+2)"""
+    global last_reminder_date
+    
+    try:
+        gmt_plus_2 = timezone(timedelta(hours=2))
+        now = datetime.now(gmt_plus_2)
+        
+        # Only run between 8:00 PM and 8:30 PM
+        if now.hour != 20 or now.minute >= 30:
+            return
+        
+        weekday = now.weekday()
+        if weekday not in [0, 2, 4, 5, 6]:  # Mon, Wed, Fri, Sat, Sun
+            return
+        
+        today_date = now.date().isoformat()
+        if last_reminder_date == today_date:
+            return
+        
+        last_reminder_date = today_date
+        game_date = get_game_date(now)
+        
+        logger.info(f"Reminder time! Checking {len(reminder_channels)} channels for {game_date}")
+        
+        for (guild_id, channel_id), club_name in reminder_channels.items():
+            try:
+                guild = bot.get_guild(guild_id)
+                if not guild:
+                    logger.warning(f"Guild {guild_id} not found")
+                    continue
+                
+                channel = guild.get_channel(channel_id)
+                if not channel:
+                    logger.warning(f"Channel {channel_id} not found")
+                    continue
+                
+                members_to_ping = await get_members_who_havent_submitted(
+                    guild, channel, club_name, game_date
+                )
+                
+                if not members_to_ping:
+                    logger.info(f"All members in {guild.name}#{channel.name} have submitted!")
+                    continue
+                
+                mentions = " ".join([member.mention for member in members_to_ping])
+                message = (
+                    f"**Attention:** {mentions}\n\n"
+                    f"🔔 This is a friendly reminder to submit a screenshot of your contest scores for the day!"
+                )
+                
+                await channel.send(message)
+                logger.info(f"Sent reminder to {len(members_to_ping)} members in {guild.name}#{channel.name}")
+                
+            except Exception as e:
+                logger.error(f"Error processing reminder for guild {guild_id}, channel {channel_id}: {str(e)}")
+                
+    except Exception as e:
+        logger.error(f"Error in reminder task: {str(e)}")
 
 async def get_guild_nick(interaction: discord.Interaction) -> Optional[str]:
     if interaction.guild is None:
@@ -480,10 +607,11 @@ def process_static_score(img: np.ndarray) -> Tuple[int, Optional[Tuple[int, int,
     return daily_high, coords
 
 def process_power_zone(img: np.ndarray) -> Tuple[int, Tuple[int, int, int, int]]:
+    """Process the power zone area of the screenshot"""
     h, w = img.shape[:2]
     
-    zp_x, zp_y = 0, int(h * 0.85)
-    zp_w, zp_h = int(w * 0.40), h - zp_y
+    zp_x, zp_y = 0, int(h * POWER_ZONE_Y_RATIO)
+    zp_w, zp_h = int(w * POWER_ZONE_WIDTH_RATIO), h - zp_y
     
     power_entries = scan_zone(img, (zp_x, zp_y, zp_w, zp_h))
     valid_power = [e for e in power_entries if e.number > MIN_POWER_THRESHOLD]
@@ -496,8 +624,9 @@ def process_power_zone(img: np.ndarray) -> Tuple[int, Tuple[int, int, int, int]]
     return found_power, (zp_x, zp_y, zp_w, zp_h)
 
 def process_leaderboard_zone(img: np.ndarray, scale_x: float, scale_y: float) -> Tuple[str, int, Tuple[int, int, int, int]]:
+    """Process the leaderboard zone area of the screenshot"""
     h, w = img.shape[:2]
-    zl_x, zl_y = int(w * 0.65), int(h * 0.60)
+    zl_x, zl_y = int(w * LEADERBOARD_ZONE_X_RATIO), int(h * LEADERBOARD_ZONE_Y_RATIO)
     zl_w, zl_h = w - zl_x, h - zl_y
     
     lb_entries = scan_zone(img, (zl_x, zl_y, zl_w, zl_h))
@@ -556,39 +685,76 @@ async def analyze_screenshot_async(image_bytes: bytes, debug: bool = False) -> A
     )
 
 async def initialize_ocr_reader():
+    """Initialize the EasyOCR reader asynchronously"""
     global reader
     if reader is None:
         try:
-            print("⏳ Initializing EasyOCR...")
+            logger.info("Initializing EasyOCR...")
             loop = asyncio.get_running_loop()
             reader = await loop.run_in_executor(
                 executor,
                 lambda: easyocr.Reader(['en'], gpu=False)
             )
-            print("✅ EasyOCR initialized")
+            logger.info("EasyOCR initialized successfully")
         except Exception as e:
-            print(f"❌ EasyOCR init failed: {str(e)}")
+            logger.error(f"EasyOCR init failed: {str(e)}")
             raise
 
 @bot.event
+async def on_error(event, *args, **kwargs):
+    """Handle general bot errors"""
+    import traceback
+    logger.error(f'Error in {event}:')
+    logger.error(traceback.format_exc())
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Global error handler for slash commands"""
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(
+            f"⏳ Command on cooldown. Try again in {error.retry_after:.1f}s",
+            ephemeral=True
+        )
+    elif isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You don't have permission to use this command.",
+            ephemeral=True
+        )
+    else:
+        logger.error(f"Command error: {str(error)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"❌ An error occurred: {str(error)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ An error occurred: {str(error)}",
+                ephemeral=True
+            )
+
+@bot.event
 async def on_ready():
-    print(f'🤖 Logged in as {bot.user}')
+    """Initialize bot when ready"""
+    logger.info(f'Logged in as {bot.user}')
     
     try:
         await initialize_ocr_reader()
-        print('⏳ Syncing commands...')
+        logger.info('Syncing commands...')
         await bot.tree.sync()
-        print('✅ Bot ready!')
+        
+        if not check_reminder_schedule.is_running():
+            check_reminder_schedule.start()
+            logger.info('Reminder task started')
+        
+        logger.info('Bot ready!')
         
     except Exception as e:
-        print(f'❌ Init failed: {str(e)}')
+        logger.error(f'Init failed: {str(e)}')
         await bot.close()
-
-@bot.event
-async def on_error(event, *args, **kwargs):
-    import traceback
-    print(f'❌ Error in {event}:')
-    traceback.print_exc()
 
 @bot.tree.command(name="submit", description="Submit a screenshot")
 @app_commands.describe(
@@ -649,7 +815,7 @@ async def submit_screenshot(
             channel_key = (interaction.guild_id, interaction.channel_id)
             club_name = activated_channels.get(channel_key, "Unknown")
         
-        submission = createSubmission(
+        submission = create_submission(
             datetime_obj=datetime.now(),
             club_name=club_name,
             highest_today=result.daily_high,
@@ -672,20 +838,115 @@ async def submit_screenshot(
             await status_msg.edit(content=f"⚠️ **Failed**\n{error_msg}")
             
     except Exception as e:
-        print(f"❌ Submit error: {str(e)}")
+        logger.error(f"Submit error: {str(e)}")
         import traceback
-        traceback.print_exc()
+        logger.error(traceback.format_exc())
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="setsubmissionreminder", description="[MOD] Enable daily submission reminders")
+@app_commands.describe(
+    club_name="The club name to track submissions for"
+)
+@app_commands.default_permissions(administrator=True)
+async def set_submission_reminder(
+    interaction: discord.Interaction,
+    club_name: str
+):
+    """Set up automated submission reminders for this channel"""
+    try:
+        # Check if user has manage_guild permission
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "❌ You need 'Manage Server' permission to use this command.",
+                ephemeral=True
+            )
+            return
+        
+        channel_key = (interaction.guild_id, interaction.channel_id)
+        
+        # Check if already activated
+        if channel_key in reminder_channels:
+            await interaction.response.send_message(
+                f"⚠️ Reminders are already active in this channel for club: **{reminder_channels[channel_key]}**\n"
+                f"Use `/deactivatesubmissionreminder` to disable first.",
+                ephemeral=True
+            )
+            return
+        
+        # Activate reminders
+        reminder_channels[channel_key] = club_name
+        save_channels(reminder_channels, REMINDERS_STORAGE_FILE)
+        
+        await interaction.response.send_message(
+            f"✅ **Submission Reminders Activated!**\n\n"
+            f"🏆 Club: **{club_name}**\n"
+            f"📅 Schedule: Monday, Wednesday, Friday, Saturday, Sunday\n"
+            f"⏰ Time: 8:00-8:30 PM GMT+2\n\n"
+            f"Members who haven't submitted will be pinged automatically.\n"
+            f"Use `/deactivatesubmissionreminder` to stop reminders.",
+            ephemeral=True
+        )
+        logger.info(f"Reminders activated for {interaction.guild.name}#{interaction.channel.name} (Club: {club_name})")
+        
+    except Exception as e:
+        logger.error(f"Set reminder error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="deactivatesubmissionreminder", description="[MOD] Disable daily submission reminders")
+@app_commands.default_permissions(administrator=True)
+async def deactivate_submission_reminder(interaction: discord.Interaction):
+    """Disable automated submission reminders for this channel"""
+    try:
+        # Check if user has manage_guild permission
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "❌ You need 'Manage Server' permission to use this command.",
+                ephemeral=True
+            )
+            return
+        
+        channel_key = (interaction.guild_id, interaction.channel_id)
+        
+        # Check if reminders are active
+        if channel_key not in reminder_channels:
+            await interaction.response.send_message(
+                "⚠️ No active reminders found in this channel.",
+                ephemeral=True
+            )
+            return
+        
+        # Get club name before removing
+        club_name = reminder_channels[channel_key]
+        
+        # Deactivate reminders
+        del reminder_channels[channel_key]
+        save_channels(reminder_channels, REMINDERS_STORAGE_FILE)
+        
+        await interaction.response.send_message(
+            f"✅ **Submission Reminders Deactivated**\n\n"
+            f"🏆 Club: **{club_name}**\n"
+            f"No more automated reminders will be sent in this channel.",
+            ephemeral=True
+        )
+        logger.info(f"Reminders deactivated for {interaction.guild.name}#{interaction.channel.name}")
+        
+    except Exception as e:
+        logger.error(f"Deactivate reminder error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        await interaction.response.send_message(f"❌ Error: {str(e)}", ephemeral=True)
 
 if __name__ == "__main__":
     try:
-        print("🚀 Starting bot...")
+        logger.info("Starting bot...")
         bot.run(DISCORD_TOKEN)
     except KeyboardInterrupt:
-        print("\n⏹️ Stopped")
+        logger.info("Bot stopped by user")
     except Exception as e:
-        print(f"❌ Fatal: {str(e)}")
+        logger.error(f"Fatal error: {str(e)}")
         import traceback
-        traceback.print_exc()
+        logger.error(traceback.format_exc())
     finally:
         cleanup_executor()

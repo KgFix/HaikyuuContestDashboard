@@ -1,0 +1,193 @@
+.dashboard {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 2rem;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+}
+
+.dashboard-header {
+  text-align: center;
+  margin-bottom: 3rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 2px solid #e0e0e0;
+}
+
+.dashboard-header h1 {
+  font-size: 2.5rem;
+  color: #2c3e50;
+  margin-bottom: 0.5rem;
+}
+
+.dashboard-header p {
+  font-size: 1.1rem;
+  color: #7f8c8d;
+}
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  margin-bottom: 2rem;
+  padding: 1.5rem;
+  background: #f8f9fa;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.view-toggle {
+  display: flex;
+  gap: 1rem;
+  justify-content: center;
+}
+
+.toggle-btn {
+  padding: 0.75rem 2rem;
+  font-size: 1rem;
+  font-weight: 600;
+  border: 2px solid #3498db;
+  background: white;
+  color: #3498db;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.toggle-btn:hover {
+  background: #ebf5fb;
+  transform: translateY(-2px);
+}
+
+.toggle-btn.active {
+  background: #3498db;
+  color: white;
+}
+
+.entity-selector {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+}
+
+.entity-selector label {
+  font-size: 1rem;
+  font-weight: 600;
+  color: #2c3e50;
+}
+
+.entity-selector select {
+  padding: 0.75rem 1.5rem;
+  font-size: 1rem;
+  border: 2px solid #bdc3c7;
+  border-radius: 6px;
+  background: white;
+  color: #2c3e50;
+  cursor: pointer;
+  min-width: 250px;
+  transition: border-color 0.3s ease;
+}
+
+.entity-selector select:hover {
+  border-color: #3498db;
+}
+
+.entity-selector select:focus {
+  outline: none;
+  border-color: #3498db;
+  box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+}
+
+.entity-selector select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.charts {
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+}
+
+.chart-container {
+  background: white;
+  padding: 1.5rem;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+.chart-title {
+  font-size: 1.5rem;
+  color: #2c3e50;
+  margin-bottom: 1rem;
+  text-align: center;
+}
+
+.loading,
+.error-message,
+.no-selection {
+  text-align: center;
+  padding: 3rem;
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.loading p {
+  font-size: 1.2rem;
+  color: #7f8c8d;
+}
+
+.error-message {
+  background: #fee;
+  border: 2px solid #e74c3c;
+}
+
+.error-message p {
+  color: #c0392b;
+  font-weight: 600;
+}
+
+.no-selection p {
+  font-size: 1.2rem;
+  color: #95a5a6;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .dashboard {
+    padding: 1rem;
+  }
+
+  .dashboard-header h1 {
+    font-size: 2rem;
+  }
+
+  .controls {
+    padding: 1rem;
+  }
+
+  .view-toggle {
+    flex-direction: column;
+  }
+
+  .toggle-btn {
+    width: 100%;
+  }
+
+  .entity-selector {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .entity-selector select {
+    width: 100%;
+  }
+
+  .chart-container {
+    padding: 1rem;
+  }
+
+  .chart-title {
+    font-size: 1.2rem;
+  }
+}

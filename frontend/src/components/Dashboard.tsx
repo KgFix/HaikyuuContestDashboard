@@ -1,10 +1,13 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
+import { useAuth } from '../auth/AuthContext';
+import { DiscordLogin } from '../auth/DiscordLogin';
 import { PerformanceChart } from './PerformanceChart';
 import type { ViewType, ChartDataPoint } from '../types';
 import './Dashboard.css';
 
 export const Dashboard = () => {
+  const { user, isAuthenticated } = useAuth();
   const [viewType, setViewType] = useState<ViewType>('club');
   const [clubs, setClubs] = useState<string[]>([]);
   const [users, setUsers] = useState<string[]>([]);
@@ -104,8 +107,20 @@ export const Dashboard = () => {
   return (
     <div className="dashboard">
       <header className="dashboard-header">
-        <h1>Haikyuu Contest Dashboard</h1>
-        <p>Track club and player performance over time</p>
+        <div className="header-content">
+          <div>
+            <h1>Haikyuu Contest Dashboard</h1>
+            <p>Track club and player performance over time</p>
+          </div>
+          <div className="header-auth">
+            <DiscordLogin />
+          </div>
+        </div>
+        {user && user.clubs.length > 0 && (
+          <div className="user-clubs-info">
+            <strong>Your Clubs:</strong> {user.clubs.join(', ')}
+          </div>
+        )}
       </header>
 
       <div className="controls">

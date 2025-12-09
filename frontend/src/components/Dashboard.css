@@ -12,6 +12,34 @@
   border-bottom: 2px solid #e0e0e0;
 }
 
+.header-content {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.header-auth {
+  display: flex;
+  align-items: center;
+}
+
+.user-clubs-info {
+  margin-top: 1rem;
+  padding: 0.75rem 1.5rem;
+  background: rgba(102, 126, 234, 0.1);
+  border: 1px solid rgba(102, 126, 234, 0.3);
+  border-radius: 8px;
+  color: #2c3e50;
+  font-size: 0.9rem;
+}
+
+.user-clubs-info strong {
+  color: #2c3e50;
+}
+
 .dashboard-header h1 {
   font-size: 2.5rem;
   color: #2c3e50;

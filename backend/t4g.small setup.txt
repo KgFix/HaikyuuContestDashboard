@@ -5,11 +5,11 @@ Step-by-Step Setup:
 1. Launch EC2 Instance
 Go to AWS Console → EC2 → Launch Instance
 Name: haikyuu-discord-bot
-AMI: Ubuntu Server 22.04 LTS (Free tier eligible)
-Instance type: t4g.micro (ARM, 1GB RAM - Free Tier: 750 hours/month)
+AMI: Ubuntu Server 24.04 LTS (Free tier eligible)
+Instance type: t4g.small (ARM, 2GB RAM - Free Tier: 750 hours/month)
 Key pair: Create new or use existing (save .pem file)
 Security Group: Default (no inbound ports needed for Discord bot)
-Storage: 8GB gp3 (Free tier includes 30GB)
+Storage: 15GB gp3 (Free tier includes 30GB)
 
 2. Connect to Instance
 ssh -i "HaikyuuBotKey.pem" ubuntu@13.50.5.247

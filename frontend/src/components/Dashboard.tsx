@@ -7,7 +7,7 @@ import type { ViewType, ChartDataPoint } from '../types';
 import './Dashboard.css';
 
 export const Dashboard = () => {
-  const { user, isAuthenticated } = useAuth();
+  const { user } = useAuth();
   const [viewType, setViewType] = useState<ViewType>('club');
   const [clubs, setClubs] = useState<string[]>([]);
   const [users, setUsers] = useState<string[]>([]);

@@ -9,12 +9,13 @@
 
 ## Required Information
 
-Before starting, gather these:
+✅ All information ready:
 
-1. **EC2 Public IP:** `_____________` (from AWS Console → EC2 → Instances)
-2. **Netlify URL:** `_____________` (from Netlify dashboard, e.g., https://your-app.netlify.app)
-3. **Discord Client ID:** (already in `.env`)
+1. **EC2 Public IP:** `13.50.5.247`
+2. **Netlify URL:** `https://haikyuucontestdashboard.netlify.app`
+3. **Discord Client ID:** `1445878524962410688` (already in `.env`)
 4. **Discord Client Secret:** (already in `.env`)
+5. **SSH Key:** `D:\All\Kirone\Projects\HaikyuuContestDashboardProject\HaikyuuBotKey.pem`
 
 ---
 
@@ -22,56 +23,35 @@ Before starting, gather these:
 
 ### Step 1: Update Redirect URIs in Discord Developer Portal
 
-1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
-2. Select your application (ID: `1445878524962410688`)
-3. Click **OAuth2** → **General**
-4. Under **Redirects**, add:
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications/1445878524962410688/oauth2)
+2. Click **OAuth2** → **General**
+3. Under **Redirects**, add:
    ```
-   https://YOUR-NETLIFY-URL.netlify.app/auth/callback
-   http://YOUR-EC2-IP:8000/api/auth/discord/callback
+   https://haikyuucontestdashboard.netlify.app/auth/callback
    ```
-5. Click **Save Changes**
+4. Click **Save Changes**
 
 ---
 
-## Part 2: Update Backend Configuration on EC2
+## Part 2: Deploy to EC2
 
-### Step 2: SSH into EC2
+### Step 2: Run Automated Deployment Script
 
-```bash
-ssh -i "your-key.pem" ubuntu@YOUR-EC2-IP
+From your Windows machine, run:
+
+```powershell
+cd "D:\All\Kirone\Projects\HaikyuuContestDashboardProject"
+.\deploy-to-ec2.ps1
 ```
 
-### Step 3: Update `.env` File
-
-```bash
-cd ~/discord-bot
-nano .env
-```
-
-**Update these lines:**
-```env
-DISCORD_REDIRECT_URI=https://YOUR-NETLIFY-URL.netlify.app/auth/callback
-FRONTEND_URL=https://YOUR-NETLIFY-URL.netlify.app
-```
-
-Save with `Ctrl+X`, then `Y`, then `Enter`.
-
-### Step 4: Deploy API Service
-
-```bash
-# Make deploy script executable
-chmod +x deploy-api.sh
-
-# Run deployment
-./deploy-api.sh
-```
-
-This will:
-- Install the systemd service file
-- Enable both services to start on boot
-- Start the API service
-- Show status of both services
+This will automatically:
+- Upload updated `.env` file with Netlify URL
+- Upload `api.service` systemd file
+- Upload `deploy-api.sh` script
+- Upload API source files
+- SSH into EC2 and run deployment
+- Install and start the API service
+- Show status of both bot and API services
 
 ---
 
@@ -95,9 +75,13 @@ This will:
 
 ## Part 4: Testing
 
-### Step 6: Test API from EC2
+### Step 3: Test API from EC2
+
+If you want to manually verify on the EC2 instance:
 
 ```bash
+ssh -i "D:\All\Kirone\Projects\HaikyuuContestDashboardProject\HaikyuuBotKey.pem" ubuntu@13.50.5.247
+
 # Test health endpoint
 curl http://localhost:8000/api/health
 
@@ -105,23 +89,25 @@ curl http://localhost:8000/api/health
 # {"status":"healthy","message":"API is running",...}
 ```
 
-### Step 7: Test API from Your Computer
+### Step 4: Test API from Your Computer
 
 ```powershell
 # From Windows PowerShell
-curl http://YOUR-EC2-IP:8000/api/health
+curl http://13.50.5.247:8000/api/health
 ```
 
-### Step 8: Test Full OAuth Flow
+### Step 5: Test Full OAuth Flow
 
-1. Open your Netlify URL in browser: `https://YOUR-NETLIFY-URL.netlify.app`
+1. Open your Netlify URL in browser: `https://haikyuucontestdashboard.netlify.app`
 2. Click **"Login with Discord"**
 3. Authorize the application
 4. Should redirect back successfully and show dashboard
 
-### Step 9: Verify Discord Bot Still Works
+### Step 6: Verify Discord Bot Still Works
 
 ```bash
+ssh -i "D:\All\Kirone\Projects\HaikyuuContestDashboardProject\HaikyuuBotKey.pem" ubuntu@13.50.5.247
+
 # On EC2
 sudo systemctl status discord-bot
 sudo journalctl -u discord-bot -f
@@ -133,17 +119,17 @@ Test a bot command in Discord (e.g., `/activate_reminder`)
 
 ## Part 5: Update Frontend Environment Variable
 
-### Step 10: Update Netlify Environment Variable
+### Step 7: Update Netlify Environment Variable
 
 1. Go to [Netlify Dashboard](https://app.netlify.com/)
-2. Select your site
+2. Select your site: **haikyuucontestdashboard**
 3. Go to **Site settings** → **Environment variables**
 4. Update or add:
    - **Key:** `VITE_API_BASE_URL`
-   - **Value:** `http://YOUR-EC2-IP:8000`
+   - **Value:** `http://13.50.5.247:8000`
 5. Click **Save**
 
-### Step 11: Redeploy Frontend
+### Step 8: Redeploy Frontend
 
 1. Go to **Deploys** tab
 2. Click **Trigger deploy** → **Deploy site**

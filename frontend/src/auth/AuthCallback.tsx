@@ -15,7 +15,7 @@ export const AuthCallback: React.FC = () => {
 
       if (!token) {
         console.error('No token in callback URL');
-        navigate('/');
+        navigate('/login');
         return;
       }
 
@@ -41,7 +41,7 @@ export const AuthCallback: React.FC = () => {
         navigate('/', { replace: true });
       } catch (error) {
         console.error('Authentication callback error:', error);
-        navigate('/');
+        navigate('/login');
       }
     };
 

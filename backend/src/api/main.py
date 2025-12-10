@@ -4,7 +4,7 @@ FastAPI Main Application
 import os
 import logging
 from datetime import datetime
-from fastapi import FastAPI, Request, HTTPException, status
+from fastapi import FastAPI, Request, HTTPException, status, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from dotenv import load_dotenv
@@ -46,6 +46,7 @@ allowed_origins = [
     FRONTEND_URL,
     "http://localhost:5173",  # Local development
     "http://localhost:3000",  # Alternative local port
+    "https://haikyuucontestdashboard.netlify.app",  # Production Netlify URL
 ]
 
 app.add_middleware(
@@ -231,7 +232,7 @@ async def logout(current_user: dict = None):
 
 
 @app.get("/api/auth/me")
-async def get_current_user_info(current_user: dict = get_current_user):
+async def get_current_user_info(current_user: dict = Depends(get_current_user)):
     """Get current authenticated user information"""
     return {
         'discord_id': current_user.get('sub'),

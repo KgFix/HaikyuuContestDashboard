@@ -2,6 +2,10 @@
 .env
 .env.*
 
+# Security - SSH keys
+*.pem
+*.ppk
+
 # Python
 __pycache__/
 *.py[cod]

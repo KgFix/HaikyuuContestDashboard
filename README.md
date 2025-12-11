@@ -1,6 +1,6 @@
 # Haikyuu Contest Dashboard
 
-Discord bot with OCR image processing (backend) + React dashboard template (frontend)
+A full-stack application that tracks Haikyuu volleyball game contest performance through Discord integration. The system uses a Discord bot to automatically process match screenshots via OCR, stores player and club statistics in DynamoDB, and displays real-time performance metrics through a React dashboard with interactive visualizations.
 
 ## Backend - Discord Bot
 

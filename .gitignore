@@ -50,3 +50,6 @@ frontend/dist/
 frontend/.env
 frontend/.env.*
 
+# Deployment scripts
+deploy-to-ec2.ps1
+

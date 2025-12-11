@@ -25,18 +25,23 @@ export const Dashboard = () => {
           api.getClubs(),
           api.getUsers()
         ]);
-        setClubs(clubsData);
-        setUsers(usersData);
+        
+        // Ensure we have arrays
+        const safeClubs = Array.isArray(clubsData) ? clubsData : [];
+        const safeUsers = Array.isArray(usersData) ? usersData : [];
+        
+        setClubs(safeClubs);
+        setUsers(safeUsers);
         
         // Select first entity by default
-        if (viewType === 'club' && clubsData.length > 0) {
-          setSelectedEntity(clubsData[0]);
-        } else if (viewType === 'player' && usersData.length > 0) {
-          setSelectedEntity(usersData[0]);
+        if (viewType === 'club' && safeClubs.length > 0) {
+          setSelectedEntity(safeClubs[0]);
+        } else if (viewType === 'player' && safeUsers.length > 0) {
+          setSelectedEntity(safeUsers[0]);
         }
       } catch (err) {
         setError('Failed to load initial data. Make sure the API server is running.');
-        console.error(err);
+        console.error('Error loading data:', err);
       }
     };
     loadData();
@@ -54,7 +59,8 @@ export const Dashboard = () => {
         if (viewType === 'club') {
           // Load club performance history
           const history = await api.getClubHistory(selectedEntity);
-          const formattedData: ChartDataPoint[] = history.map(item => ({
+          const safeHistory = Array.isArray(history) ? history : [];
+          const formattedData: ChartDataPoint[] = safeHistory.map(item => ({
             date: item.date,
             value: item.maxTotalPower,
             label: 'Max Total Power'
@@ -63,7 +69,8 @@ export const Dashboard = () => {
 
           // Load club activity history
           const activity = await api.getClubActivity(selectedEntity);
-          const activityFormatted: ChartDataPoint[] = activity.map(item => ({
+          const safeActivity = Array.isArray(activity) ? activity : [];
+          const activityFormatted: ChartDataPoint[] = safeActivity.map(item => ({
             date: item.date,
             value: item.totalUsers,
             label: 'Active Users'
@@ -72,7 +79,8 @@ export const Dashboard = () => {
         } else {
           // Load user performance history
           const history = await api.getUserHistory(selectedEntity);
-          const formattedData: ChartDataPoint[] = history.map(item => ({
+          const safeHistory = Array.isArray(history) ? history : [];
+          const formattedData: ChartDataPoint[] = safeHistory.map(item => ({
             date: item.date,
             value: item.bestHighestToday,
             label: 'Best Score'
@@ -82,7 +90,7 @@ export const Dashboard = () => {
         }
       } catch (err) {
         setError(`Failed to load ${viewType} data`);
-        console.error(err);
+        console.error('Error loading performance data:', err);
       } finally {
         setLoading(false);
       }

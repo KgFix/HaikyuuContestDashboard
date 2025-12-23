@@ -769,14 +769,17 @@ def find_leaderboard_name_and_score(
 
 def process_static_score(img: np.ndarray) -> Tuple[int, Optional[Tuple[int, int, int, int]]]:
     """Process the static center score ROI"""
+    logger.info("Processing static score...")
     config = STATIC_ROIS["CENTER_SCORE_ROI"]
     roi, coords = get_anchored_roi(img, config['rect'], config['anchor_x'], config['anchor_y'])
     raw_score = ocr_static_roi(roi, is_number=True)
     daily_high = clean_text(raw_score, is_number=True)
+    logger.info(f"Static score processed: {daily_high}")
     return daily_high, coords
 
 def process_power_zone(img: np.ndarray) -> Tuple[int, Tuple[int, int, int, int]]:
     """Process the power zone area (bottom-left of screenshot)"""
+    logger.info("Processing power zone...")
     h, w = img.shape[:2]
     
     zp_x = 0
@@ -793,6 +796,7 @@ def process_power_zone(img: np.ndarray) -> Tuple[int, Tuple[int, int, int, int]]
         valid_power.sort(key=lambda k: k.cx)
         found_power = valid_power[0].number
     
+    logger.info(f"Power zone processed: {found_power}")
     return found_power, (zp_x, zp_y, zp_w, zp_h)
 
 def process_leaderboard_zone(
@@ -801,6 +805,7 @@ def process_leaderboard_zone(
     scale_y: float
 ) -> Tuple[str, int, Tuple[int, int, int, int]]:
     """Process the leaderboard zone (bottom-right of screenshot)"""
+    logger.info("Processing leaderboard zone...")
     h, w = img.shape[:2]
     
     zl_x = int(w * LEADERBOARD_ZONE_X_RATIO)
@@ -811,6 +816,7 @@ def process_leaderboard_zone(
     lb_entries = scan_zone(img, (zl_x, zl_y, zl_w, zl_h))
     lb_name, lb_score = find_leaderboard_name_and_score(lb_entries, scale_x, scale_y)
     
+    logger.info(f"Leaderboard zone processed: name={lb_name}, score={lb_score}")
     return lb_name, lb_score, (zl_x, zl_y, zl_w, zl_h)
 
 # ============================================================================
@@ -827,22 +833,29 @@ async def analyze_screenshot_async(
     2. Power zone (total power)
     3. Leaderboard zone (rank name and score)
     """
+    logger.info("Starting screenshot analysis")
+    
     if not image_bytes:
         raise ValueError("No image data provided")
     
     # Decode image
+    logger.info("Decoding image...")
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError("Could not decode image")
+    
+    logger.info(f"Image decoded: {img.shape}")
     
     # Downscale if needed
     img = downscale_if_needed(img)
     
     # Calculate scale factors
     scale_x, scale_y = calculate_scale_from_image(img)
+    logger.info(f"Scale factors: x={scale_x:.3f}, y={scale_y:.3f}")
     
     # Process all zones in parallel
+    logger.info("Starting parallel zone processing...")
     loop = asyncio.get_event_loop()
     
     score_task = loop.run_in_executor(executor, process_static_score, img)
@@ -856,9 +869,17 @@ async def analyze_screenshot_async(
     )
     
     # Await all results
+    logger.info("Awaiting score task...")
     daily_high, score_coords = await score_task
+    logger.info(f"Score task complete: daily_high={daily_high}")
+    
+    logger.info("Awaiting power task...")
     found_power, power_zone = await power_task
+    logger.info(f"Power task complete: found_power={found_power}")
+    
+    logger.info("Awaiting leaderboard task...")
     lb_name, lb_score, lb_zone = await leaderboard_task
+    logger.info(f"Leaderboard task complete: name={lb_name}, score={lb_score}")
     
     # Debug visualization if requested
     if debug:
@@ -885,6 +906,7 @@ async def analyze_screenshot_async(
         except Exception as e:
             logger.error(f"Failed to save debug image: {str(e)}")
     
+    logger.info("Screenshot analysis complete")
     return AnalysisResult(
         daily_high=daily_high,
         total_power=found_power,
@@ -1262,7 +1284,27 @@ async def submit_screenshot(
             content="⏳ **Processing screenshot...**\n🔍 Analyzing with OCR..."
         )
         
-        result = await analyze_screenshot_async(image_bytes, debug=False)
+        try:
+            # Add timeout for OCR analysis (60 seconds)
+            result = await asyncio.wait_for(
+                analyze_screenshot_async(image_bytes, debug=False),
+                timeout=60.0
+            )
+            logger.info(f"OCR analysis completed for {interaction.user.display_name}")
+        except asyncio.TimeoutError:
+            logger.error(f"OCR analysis timeout for {interaction.user.display_name}")
+            await status_msg.edit(
+                content="❌ **Analysis timeout.** The image took too long to process. Please try again."
+            )
+            return
+        except Exception as ocr_error:
+            logger.error(f"OCR analysis failed: {str(ocr_error)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await status_msg.edit(
+                content=f"❌ **Analysis failed:** {str(ocr_error)}"
+            )
+            return
         
         # Save to database
         await status_msg.edit(

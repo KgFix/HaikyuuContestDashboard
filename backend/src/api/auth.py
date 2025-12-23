@@ -76,7 +76,8 @@ async def exchange_code_for_token(code: str) -> Dict:
     }
     
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=10)  # 10 second timeout
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(DISCORD_TOKEN_URL, data=data, headers=headers) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
@@ -104,7 +105,8 @@ async def get_discord_user(access_token: str) -> Dict:
     }
     
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=10)  # 10 second timeout
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(DISCORD_USER_URL, headers=headers) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
@@ -132,7 +134,8 @@ async def get_user_guilds(access_token: str) -> List[Dict]:
     }
     
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=10)  # 10 second timeout
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(DISCORD_GUILDS_URL, headers=headers) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
@@ -162,15 +165,16 @@ async def get_guild_member(access_token: str, guild_id: str) -> Dict:
     url = DISCORD_GUILD_MEMBER_URL.format(guild_id=guild_id)
     
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=5)  # 5 second timeout for each guild
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, headers=headers) as resp:
                 if resp.status != 200:
                     # User might not have granted guilds.members.read scope
                     logger.warning(f"Failed to fetch member info for guild {guild_id}")
                     return None
                 return await resp.json()
-    except aiohttp.ClientError as e:
-        logger.error(f"Discord API request failed: {str(e)}")
+    except (aiohttp.ClientError, Exception) as e:
+        logger.warning(f"Discord API request failed for guild {guild_id}: {str(e)}")
         return None
 
 
@@ -187,9 +191,14 @@ async def determine_user_clubs(access_token: str, bot_token: str) -> List[str]:
     
     Returns: List of club names the user can access
     """
+    import asyncio
+    
     try:
-        # Get user's guilds
-        user_guilds = await get_user_guilds(access_token)
+        # Get user's guilds with timeout
+        user_guilds = await asyncio.wait_for(
+            get_user_guilds(access_token),
+            timeout=10.0
+        )
         user_guild_ids = {guild['id'] for guild in user_guilds}
         
         # Load activated channels
@@ -198,41 +207,57 @@ async def determine_user_clubs(access_token: str, bot_token: str) -> List[str]:
         # Get bot token for role fetching (need bot token to get role details)
         allowed_clubs = set()
         
+        # Collect guilds to check
+        guilds_to_check = []
         for (guild_id, channel_id), club_name in activated_channels.items():
             # Check if user is in this guild
-            if str(guild_id) not in user_guild_ids:
-                continue
-            
-            # Get user's member info in this guild
-            member_info = await get_guild_member(access_token, str(guild_id))
-            
-            if not member_info:
-                # If we can't get member info, grant access anyway (user is in guild)
-                logger.info(f"User in guild {guild_id}, granting access to {club_name}")
-                allowed_clubs.add(club_name)
-                continue
-            
-            # Check if club_name contains a role mention (e.g., "@BotTestRole")
-            # Extract role name from club_name
-            if club_name.startswith('@'):
-                role_name = club_name[1:]  # Remove @ prefix
+            if str(guild_id) in user_guild_ids:
+                guilds_to_check.append((guild_id, club_name))
+        
+        # Fetch all member info in parallel with timeout
+        if guilds_to_check:
+            try:
+                member_tasks = [
+                    get_guild_member(access_token, str(guild_id))
+                    for guild_id, _ in guilds_to_check
+                ]
+                # Wait for all with timeout (5 seconds total for all parallel requests)
+                member_results = await asyncio.wait_for(
+                    asyncio.gather(*member_tasks, return_exceptions=True),
+                    timeout=5.0
+                )
                 
-                # Get role IDs from member_info
-                user_role_ids = set(member_info.get('roles', []))
-                
-                # We need to fetch guild roles to match role name to ID
-                # For now, we'll grant access if user is in the guild
-                # In production, you'd want to cache guild roles or fetch them
-                logger.info(f"User has roles in guild {guild_id}: {user_role_ids}")
-                allowed_clubs.add(club_name)
-            else:
-                # No role requirement, just guild membership
-                allowed_clubs.add(club_name)
+                # Process results
+                for (guild_id, club_name), member_info in zip(guilds_to_check, member_results):
+                    # If member_info is an exception or None, grant access anyway
+                    if isinstance(member_info, Exception) or not member_info:
+                        logger.info(f"User in guild {guild_id}, granting access to {club_name}")
+                        allowed_clubs.add(club_name)
+                        continue
+                    
+                    # Check if club_name contains a role mention (e.g., "@BotTestRole")
+                    if club_name.startswith('@'):
+                        role_name = club_name[1:]  # Remove @ prefix
+                        user_role_ids = set(member_info.get('roles', []))
+                        logger.info(f"User has roles in guild {guild_id}: {user_role_ids}")
+                        allowed_clubs.add(club_name)
+                    else:
+                        # No role requirement, just guild membership
+                        allowed_clubs.add(club_name)
+                        
+            except asyncio.TimeoutError:
+                logger.warning("Timeout fetching member info, granting access based on guild membership")
+                # Grant access to all clubs in guilds user is member of
+                for guild_id, club_name in guilds_to_check:
+                    allowed_clubs.add(club_name)
         
         result = sorted(list(allowed_clubs))
         logger.info(f"User has access to {len(result)} clubs: {result}")
         return result
         
+    except asyncio.TimeoutError:
+        logger.error("Timeout determining user clubs")
+        return []
     except Exception as e:
         logger.error(f"Error determining user clubs: {str(e)}")
         # In case of error, return empty list (no access)

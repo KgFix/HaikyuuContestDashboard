@@ -1,0 +1,211 @@
+import { useState, useEffect } from 'react';
+import { mockApi } from './mockData';
+import { PerformanceChart } from './PerformanceChart';
+import type { ViewType, ChartDataPoint } from './types';
+import './Dashboard.css';
+
+export const Dashboard = () => {
+  const [viewType, setViewType] = useState<ViewType>('club');
+  const [clubs, setClubs] = useState<string[]>([]);
+  const [users, setUsers] = useState<string[]>([]);
+  const [selectedEntity, setSelectedEntity] = useState<string>('');
+  const [chartData, setChartData] = useState<ChartDataPoint[]>([]);
+  const [activityData, setActivityData] = useState<ChartDataPoint[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Load clubs and users on mount
+  useEffect(() => {
+    const loadData = async () => {
+      try {
+        const [clubsData, usersData] = await Promise.all([
+          mockApi.getClubs(),
+          mockApi.getUsers()
+        ]);
+        
+        const safeClubs = Array.isArray(clubsData) ? clubsData : [];
+        const safeUsers = Array.isArray(usersData) ? usersData : [];
+        
+        setClubs(safeClubs);
+        setUsers(safeUsers);
+        
+        // Select first entity by default
+        if (viewType === 'club' && safeClubs.length > 0) {
+          setSelectedEntity(safeClubs[0]);
+        } else if (viewType === 'player' && safeUsers.length > 0) {
+          setSelectedEntity(safeUsers[0]);
+        }
+      } catch (err) {
+        setError('Failed to load initial data');
+        console.error('Error loading data:', err);
+      }
+    };
+    loadData();
+  }, []);
+
+  // Load performance data when entity or view type changes
+  useEffect(() => {
+    if (!selectedEntity) return;
+
+    const loadPerformanceData = async () => {
+      setLoading(true);
+      setError(null);
+      
+      try {
+        if (viewType === 'club') {
+          // Load club performance history
+          const history = await mockApi.getClubHistory(selectedEntity);
+          const safeHistory = Array.isArray(history) ? history : [];
+          const formattedData: ChartDataPoint[] = safeHistory.map(item => ({
+            date: item.date,
+            value: item.maxTotalPower,
+            label: 'Max Total Power'
+          }));
+          setChartData(formattedData);
+
+          // Load club activity history
+          const activity = await mockApi.getClubActivity(selectedEntity);
+          const safeActivity = Array.isArray(activity) ? activity : [];
+          const activityFormatted: ChartDataPoint[] = safeActivity.map(item => ({
+            date: item.date,
+            value: item.totalUsers,
+            label: 'Active Users'
+          }));
+          setActivityData(activityFormatted);
+        } else {
+          // Load user performance history
+          const history = await mockApi.getUserHistory(selectedEntity);
+          const safeHistory = Array.isArray(history) ? history : [];
+          const formattedData: ChartDataPoint[] = safeHistory.map(item => ({
+            date: item.date,
+            value: item.bestHighestToday,
+            label: 'Best Score'
+          }));
+          setChartData(formattedData);
+          setActivityData([]);
+        }
+      } catch (err) {
+        setError(`Failed to load ${viewType} data`);
+        console.error('Error loading performance data:', err);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadPerformanceData();
+  }, [selectedEntity, viewType]);
+
+  // Handle view type change
+  const handleViewTypeChange = (newViewType: ViewType) => {
+    setViewType(newViewType);
+    // Select first entity of new type
+    if (newViewType === 'club' && clubs.length > 0) {
+      setSelectedEntity(clubs[0]);
+    } else if (newViewType === 'player' && users.length > 0) {
+      setSelectedEntity(users[0]);
+    }
+  };
+
+  const entityList = viewType === 'club' ? clubs : users;
+
+  return (
+    <div className="dashboard">
+      <header className="dashboard-header">
+        <div className="header-content">
+          <div>
+            <h1>Haikyuu Contest Dashboard</h1>
+            <p>Track club and player performance over time</p>
+          </div>
+          <div className="test-mode-badge">
+            <span>🧪 TEST MODE - Mock Data</span>
+          </div>
+        </div>
+      </header>
+
+      <div className="controls">
+        <div className="view-toggle">
+          <button
+            className={`toggle-btn ${viewType === 'club' ? 'active' : ''}`}
+            onClick={() => handleViewTypeChange('club')}
+          >
+            Club View
+          </button>
+          <button
+            className={`toggle-btn ${viewType === 'player' ? 'active' : ''}`}
+            onClick={() => handleViewTypeChange('player')}
+          >
+            Player View
+          </button>
+        </div>
+
+        <div className="entity-selector">
+          <label htmlFor="entity-select">
+            Select {viewType === 'club' ? 'Club' : 'Player'}:
+          </label>
+          <select
+            id="entity-select"
+            value={selectedEntity}
+            onChange={(e) => setSelectedEntity(e.target.value)}
+            disabled={loading}
+          >
+            <option value="">-- Select --</option>
+            {entityList.map(entity => (
+              <option key={entity} value={entity}>
+                {entity}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {error && (
+        <div className="error-message">
+          <p>⚠️ {error}</p>
+        </div>
+      )}
+
+      {loading && (
+        <div className="loading">
+          <p>Loading data...</p>
+        </div>
+      )}
+
+      {!loading && !error && selectedEntity && (
+        <div className="charts">
+          {viewType === 'club' ? (
+            <>
+              <PerformanceChart
+                data={chartData}
+                title={`${selectedEntity} - Total Power Over Time`}
+                dataKey="value"
+                yAxisLabel="Total Power"
+                color="#8884d8"
+              />
+              <PerformanceChart
+                data={activityData}
+                title={`${selectedEntity} - Daily Active Users`}
+                dataKey="value"
+                yAxisLabel="Active Users"
+                color="#82ca9d"
+              />
+            </>
+          ) : (
+            <PerformanceChart
+              data={chartData}
+              title={`${selectedEntity} - Daily Best Score`}
+              dataKey="value"
+              yAxisLabel="Score"
+              color="#8884d8"
+            />
+          )}
+        </div>
+      )}
+
+      {!loading && !error && !selectedEntity && (
+        <div className="no-selection">
+          <p>Select a {viewType} to view performance data</p>
+        </div>
+      )}
+    </div>
+  );
+};
